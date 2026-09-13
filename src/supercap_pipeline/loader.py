@@ -66,31 +66,52 @@ def load_experiment(cv_folder: str | Path) -> tuple[pd.DataFrame, dict]:
 # Metadata
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_metadata(folder: Path) -> dict:
+def read_info_json(folder: Path) -> dict:
+    """
+    Load the raw `*info.json` metadata file from a measurement folder.
+
+    Shared by the CV loader (this module) and the GCD loader so both read
+    cell composition (electrodes, masses, electrolyte) the same way.
+    """
     info_files = list(folder.glob("*info.json"))
     if not info_files:
         raise FileNotFoundError(f"No info.json found in {folder}")
 
     with open(info_files[0], encoding="utf-8") as fh:
-        info = json.load(fh)
+        return json.load(fh)
 
-    fields   = info["testCell"]["composition"]["fields"]
+
+def composition_field(info: dict, key: str, subkey: str | None = "componentName"):
+    """
+    Look up one `testCell.composition.fields[...]` entry by its definition key.
+
+    Returns the field's scalar value, or `value[subkey]` if the value is a
+    nested component dict (e.g. Electrode1 -> {"componentName": "..."}).
+    `subkey=None` returns the raw value (used for plain numbers like masses).
+    """
+    fields = info["testCell"]["composition"]["fields"]
+    try:
+        v = next(
+            f["value"] for f in fields
+            if f.get("definition", {}).get("key") == key
+        )
+    except StopIteration:
+        return None
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        return v.get(subkey) if subkey is not None else v
+    return v
+
+
+def _load_metadata(folder: Path) -> dict:
+    info = read_info_json(folder)
+
     cell_tag = info["testCell"]["cellTag"]
     exp_name = info["experiment"]["experimentName"]
 
     def _get(key: str, subkey: str = "componentName"):
-        try:
-            v = next(
-                f["value"] for f in fields
-                if f.get("definition", {}).get("key") == key
-            )
-            if v is None:
-                return None
-            if isinstance(v, dict):
-                return v.get(subkey)
-            return v
-        except StopIteration:
-            return None
+        return composition_field(info, key, subkey)
 
     e1_name    = _get("Electrode1")
     e2_name    = _get("Electrode2")
@@ -125,21 +146,40 @@ def _load_metadata(folder: Path) -> dict:
 # Output.txt loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_output_txt(folder: Path, meta: dict) -> pd.DataFrame:
-    out_file = folder / "Output.txt"
-    if not out_file.exists():
-        raise FileNotFoundError(f"Output.txt not found in {folder}")
+# Columns that are text/flags rather than numeric measurements. Shared with
+# gcd_loader.py so both techniques parse the tester's Output.txt identically.
+TESTER_STR_COLUMNS: set[str] = {"type", "c/d", "p/g", "con", "I-Range", "over", "buf"}
 
-    df = pd.read_csv(out_file, sep="\t", skiprows=[1], low_memory=False)
+
+def read_tester_txt(path: Path) -> pd.DataFrame:
+    """
+    Parse one tester Output.txt file (tab-separated, CRLF, row 2 = units).
+
+    Shared by the CV loader (this module) and the GCD loader. Strips column
+    names and string-typed cell values, coerces every other column to numeric
+    (invalid/blank -> NaN), sorts by time and resets the index.
+
+    Does NOT drop rows with NaN in any particular column -- callers decide
+    which columns are required for their technique.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"{path.name} not found in {path.parent}")
+
+    df = pd.read_csv(path, sep="\t", skiprows=[1], low_memory=False)
     df.columns = [c.strip() for c in df.columns]
 
-    # String columns
-    str_cols = {"type", "c/d", "p/g", "con", "I-Range", "over", "buf"}
     for col in df.columns:
-        if col in str_cols:
+        if col in TESTER_STR_COLUMNS:
             df[col] = df[col].astype(str).str.strip()
         else:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.sort_values("t").reset_index(drop=True)
+    return df
+
+
+def _load_output_txt(folder: Path, meta: dict) -> pd.DataFrame:
+    df = read_tester_txt(folder / "Output.txt")
 
     df = (
         df.dropna(subset=["t", "V12"])

@@ -1,0 +1,107 @@
+{
+  "scriptExecutionId": "3ee35d1f-e55f-443e-94c3-e6f4652336a3",
+  "createdOn": "2026-09-01T09:44:01.483394+02:00",
+  "experiment": {
+    "experimentId": "c368993b-2421-4310-b3b6-64e0366ef56b",
+    "experimentName": "2026-08-27-BIA-BA-244-01-Supercap-FullCell-II",
+    "experimentCellGroupId": "8a5dd64c-e3c0-4d2f-bccc-dde63bb7132e",
+    "experimentCellGroupName": "BIA-BA-244-01"
+  },
+  "testCell": {
+    "testCellId": "b3c7ce0f-9bde-4a44-a5c9-dfce34e7db0d",
+    "cellTag": "A7029",
+    "cellBuildNumber": 9,
+    "patCellType": "PatCell",
+    "composition": {
+      "fields": [
+        {
+          "_t": "electrode",
+          "definition": {
+            "key": "Electrode2",
+            "name": "Electrode 2",
+            "group": "Group",
+            "unit": "",
+            "position": 2100,
+            "luaVariableName": null,
+            "style": { "color": "#0000FF", "highlight": true }
+          },
+          "isReadOnly": false,
+          "value": { "componentId": "b41cef13-f924-499d-9590-f2a24415bc43", "componentName": "Mesoporous Carbon" }
+        },
+        {
+          "_t": "double",
+          "definition": {
+            "key": "Weight2",
+            "name": "Electrode Weight 2",
+            "group": "Cell",
+            "unit": "g",
+            "position": 2110,
+            "luaVariableName": "m2",
+            "style": null
+          },
+          "isReadOnly": false,
+          "value": 0.0138
+        },
+        {
+          "_t": "electrolyte",
+          "definition": {
+            "key": "Electrolyte",
+            "name": "Electrolyte",
+            "group": "Group",
+            "unit": "",
+            "position": 3100,
+            "luaVariableName": null,
+            "style": null
+          },
+          "isReadOnly": false,
+          "value": { "componentId": "a0d3e8d2-565c-4ff2-9641-8386c897ad96", "componentName": "1 M TEABF4 in Acetornitrile" }
+        },
+        {
+          "_t": "electrode",
+          "definition": {
+            "key": "Electrode1",
+            "name": "Electrode 1",
+            "group": "Group",
+            "unit": "",
+            "position": 5100,
+            "luaVariableName": null,
+            "style": { "color": "#FF0000", "highlight": true }
+          },
+          "isReadOnly": false,
+          "value": { "componentId": "b41cef13-f924-499d-9590-f2a24415bc43", "componentName": "Mesoporous Carbon" }
+        },
+        {
+          "_t": "double",
+          "definition": {
+            "key": "Weight1",
+            "name": "Electrode Weight 1",
+            "group": "Cell",
+            "unit": "g",
+            "position": 5110,
+            "luaVariableName": "m1",
+            "style": null
+          },
+          "isReadOnly": false,
+          "value": 0.0138
+        }
+      ]
+    }
+  },
+  "gcdConfig": {
+    "basis": "total_active_mass"
+  },
+  "script": {
+    "scriptType": "Composer",
+    "scriptId": "a7323d60-e81a-45a0-9f72-aef6ba3f5c32",
+    "scriptName": "Galvanostatic Polarization Method 2.5V(3) (2)"
+  },
+  "channel": {
+    "controllerType": "I16",
+    "controllerId": "fff7cde7-110f-44b7-9228-a2912011a95c",
+    "controllerName": "i16-1875",
+    "channelId": "079a5ec5-7b5f-554e-a501-d7c6a8fd7b36",
+    "channelName": "Channel 04",
+    "channelBoardId": "004100213233511238333832",
+    "channelBoardSerialNumber": "CB001653"
+  }
+}
