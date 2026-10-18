@@ -83,3 +83,65 @@ def test_run_experiment_dispatches_per_subfolder(tmp_path, monkeypatch):
 
     assert calls["cv"] == ["01_Cyclic Voltametry"]
     assert calls["gcd"] == ["02_Galvanostatic Polarization Method 2.5V(3)"]
+
+
+def test_run_experiment_finds_nested_measurements_from_experiment_root(tmp_path, monkeypatch):
+    # <exp>/<cell_group>/<cell_tag>/<step>/Output.txt, run from <exp>
+    exp = tmp_path / "2026-10-13-BIA-VR-017-MC-Supercap-FullCell"
+    _write_output_txt(exp / "BIA-VR-017-01" / "A0001" / "01_Cyclic Voltametry", [
+        "0.0\t1\t10\tVS\t-\t0.0\t0.1",
+    ])
+    _write_output_txt(exp / "BIA-VR-017-02" / "A0002" / "01_Cyclic Voltametry", [
+        "0.0\t1\t10\tVS\t-\t0.0\t0.1",
+    ])
+
+    calls = []
+    monkeypatch.setattr(
+        "supercap_pipeline.pipeline.run",
+        lambda folder, output_dir=None: calls.append((Path(folder), output_dir)),
+    )
+
+    out = tmp_path / "out"
+    run_experiment(exp, output_dir=out)
+
+    assert [f.relative_to(exp) for f, _ in calls] == [
+        Path("BIA-VR-017-01/A0001/01_Cyclic Voltametry"),
+        Path("BIA-VR-017-02/A0002/01_Cyclic Voltametry"),
+    ]
+    # several measurements + explicit -o -> separate subdirectories, no overwriting
+    assert [o for _, o in calls] == [
+        out / "BIA-VR-017-01/A0001/01_Cyclic Voltametry",
+        out / "BIA-VR-017-02/A0002/01_Cyclic Voltametry",
+    ]
+
+
+def test_run_experiment_on_single_measurement_folder(tmp_path, monkeypatch):
+    folder = tmp_path / "A0001" / "01_Cyclic Voltametry"
+    _write_output_txt(folder, ["0.0\t1\t10\tVS\t-\t0.0\t0.1"])
+
+    calls = []
+    monkeypatch.setattr(
+        "supercap_pipeline.pipeline.run",
+        lambda folder, output_dir=None: calls.append((Path(folder), output_dir)),
+    )
+
+    run_experiment(folder, output_dir=tmp_path / "out")
+    assert calls == [(folder, tmp_path / "out")]
+
+
+def test_run_experiment_continues_after_failure(tmp_path, monkeypatch):
+    exp = tmp_path / "exp"
+    _write_output_txt(exp / "A0001" / "01_CV", ["0.0\t1\t10\tVS\t-\t0.0\t0.1"])
+    _write_output_txt(exp / "A0002" / "01_CV", ["0.0\t1\t10\tVS\t-\t0.0\t0.1"])
+
+    calls = []
+
+    def fake_run(folder, output_dir=None):
+        calls.append(Path(folder).parent.name)
+        if Path(folder).parent.name == "A0001":
+            raise FileNotFoundError("No info.json found")
+
+    monkeypatch.setattr("supercap_pipeline.pipeline.run", fake_run)
+
+    run_experiment(exp)
+    assert calls == ["A0001", "A0002"]

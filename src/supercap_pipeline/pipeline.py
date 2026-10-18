@@ -249,42 +249,73 @@ def run_gcd(
     print(f"{'-'*60}\n")
 
 
+def find_measurement_folders(root: str | Path) -> list[Path]:
+    """
+    Every folder at or below `root` that directly contains an Output.txt,
+    sorted by path. Lets the CLI accept an experiment, cell-group, cell or
+    single-measurement folder alike.
+    """
+    root = Path(root)
+    return sorted({p.parent for p in root.rglob("Output.txt") if p.is_file()})
+
+
 def run_experiment(
     cell_folder: str | Path,
     output_dir: str | Path | None = None,
 ) -> None:
     """
-    Run CV and/or GCD analysis for every step subfolder of one cell folder
-    (e.g. `<exp>/<cell_group>/<cell_tag>/`), dispatching per subfolder based
-    on detect_technique(). Subfolders with no Output.txt, or whose content
-    matches neither technique, are skipped and logged.
+    Run CV and/or GCD analysis for every measurement folder at or below
+    `cell_folder` (an experiment, cell-group or cell folder), dispatching
+    per folder based on detect_technique(). Folders whose content matches
+    neither technique are skipped and logged; a folder that fails to
+    analyze is reported and does not stop the remaining ones.
+
+    If `output_dir` is given and several measurements are found, each one
+    writes to `output_dir/<path relative to cell_folder>` so results don't
+    overwrite each other. Without it, each measurement uses its own
+    default output directory.
     """
     cell_folder = Path(cell_folder)
-    subfolders = sorted(p for p in cell_folder.iterdir() if p.is_dir())
+    measurements = find_measurement_folders(cell_folder)
 
     print(f"\n{'='*60}")
     print(f"  Supercap Experiment Dispatch")
-    print(f"  Cell folder : {cell_folder}")
+    print(f"  Folder      : {cell_folder}")
+    print(f"  Measurements: {len(measurements)} folder(s) with Output.txt")
     print(f"{'='*60}")
 
     ran = 0
-    for sub in subfolders:
-        if not (sub / "Output.txt").exists():
-            continue
+    failed: list[tuple[Path, Exception]] = []
+    for sub in measurements:
+        rel = sub.relative_to(cell_folder)
         technique = detect_technique(sub)
-        print(f"\n  [{sub.name}] -> detected technique: {technique}")
-        if technique == "cv":
-            run(sub, output_dir=output_dir)
-            ran += 1
-        elif technique == "gcd":
-            run_gcd(sub, output_dir=output_dir)
-            ran += 1
-        else:
-            log.warning("Skipping %s: could not determine technique from Output.txt content.", sub)
+        print(f"\n  [{rel}] -> detected technique: {technique}")
 
-    if ran == 0:
-        log.warning("No CV or GCD subfolders with recognizable Output.txt found in %s.", cell_folder)
+        if technique == "unknown":
+            log.warning("Skipping %s: could not determine technique from Output.txt content.", sub)
+            continue
+
+        sub_out = None
+        if output_dir is not None:
+            sub_out = Path(output_dir) if len(measurements) == 1 else Path(output_dir) / rel
+
+        try:
+            if technique == "cv":
+                run(sub, output_dir=sub_out)
+            else:
+                run_gcd(sub, output_dir=sub_out)
+            ran += 1
+        except Exception as exc:
+            log.exception("Analysis failed for %s", sub)
+            failed.append((sub, exc))
+
+    if not measurements:
+        log.warning("No folders containing Output.txt found in %s.", cell_folder)
 
     print(f"\n{'='*60}")
-    print(f"  Experiment dispatch done: {ran} subfolder(s) analyzed.")
+    print(f"  Experiment dispatch done: {ran} measurement(s) analyzed.")
+    if failed:
+        print(f"  {len(failed)} measurement(s) FAILED:")
+        for sub, exc in failed:
+            print(f"    {sub.relative_to(cell_folder)}: {type(exc).__name__}: {exc}")
     print(f"{'='*60}\n")
