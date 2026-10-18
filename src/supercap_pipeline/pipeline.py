@@ -61,8 +61,11 @@ def detect_technique(folder: str | Path) -> str:
     name (step-folder names are free text and not a reliable signal, e.g.
     "01_Galvanostatic Polarization Method 2.5V(3)").
 
-    Returns "cv" if any row has type == "VS", "gcd" if any row has
-    type == "CC" with c/d in {"c", "d"}, else "unknown".
+    Returns "eis" for impedance measurements (any step type mentioning EIS
+    / impedance, or -- as a negative signal only -- "EIS" in the folder
+    name; PEIS steps often carry a few CC rows that would otherwise look
+    like GCD), "cv" if any row has type == "VS", "gcd" if there are CC rows
+    with both c/d == "c" and c/d == "d", else "unknown".
     """
     folder = Path(folder)
     out_file = folder / "Output.txt"
@@ -70,9 +73,13 @@ def detect_technique(folder: str | Path) -> str:
         return "unknown"
 
     df = read_tester_txt(out_file)
-    if (df["type"] == "VS").any():
+    types = df["type"].str.upper()
+    if types.str.contains("EIS|IMP|FRA", regex=True).any() or "EIS" in folder.name.upper():
+        return "eis"
+    if (types == "VS").any():
         return "cv"
-    if ((df["type"] == "CC") & df["c/d"].isin(["c", "d"])).any():
+    cc_dirs = set(df.loc[types == "CC", "c/d"]) if "c/d" in df.columns else set()
+    if {"c", "d"} <= cc_dirs:
         return "gcd"
     return "unknown"
 
@@ -165,6 +172,7 @@ def run(
 def run_gcd(
     gcd_folder: str | Path,
     output_dir: str | Path | None = None,
+    basis: str | None = None,
 ) -> None:
     """
     Full analysis pipeline for one galvanostatic charge/discharge (GCD)
@@ -172,11 +180,13 @@ def run_gcd(
 
     Parameters
     ----------
-    gcd_folder : path to the measurement folder (Output.txt + info.json,
-                 the latter requiring a `gcdConfig.basis` entry and valid
-                 Weight1/Weight2 -- see gcd_loader.load_gcd_experiment())
+    gcd_folder : path to the measurement folder (Output.txt + info.json
+                 with valid Weight1/Weight2 -- see
+                 gcd_loader.load_gcd_experiment())
     output_dir : where to save CSVs, the QC report and PDFs; defaults to
                  <experiment_root>/output/<cell_group>/<cell_tag>/
+    basis      : normalization convention; overrides info.json's
+                 `gcdConfig.basis`, one of the two is required
     """
     gcd_folder = Path(gcd_folder)
     output_dir = Path(output_dir) if output_dir is not None else _default_output_dir(gcd_folder)
@@ -189,7 +199,7 @@ def run_gcd(
     print(f"{'-'*60}")
 
     # ── 1. Load ───────────────────────────────────────────────────────────────
-    df, meta = load_gcd_experiment(gcd_folder)
+    df, meta = load_gcd_experiment(gcd_folder, basis=basis)
 
     print(f"\n  Cell tag    : {meta['cell_tag']}")
     print(f"  Experiment  : {meta['exp_name']}")
@@ -262,13 +272,15 @@ def find_measurement_folders(root: str | Path) -> list[Path]:
 def run_experiment(
     cell_folder: str | Path,
     output_dir: str | Path | None = None,
+    gcd_basis: str | None = None,
 ) -> None:
     """
     Run CV and/or GCD analysis for every measurement folder at or below
     `cell_folder` (an experiment, cell-group or cell folder), dispatching
-    per folder based on detect_technique(). Folders whose content matches
-    neither technique are skipped and logged; a folder that fails to
-    analyze is reported and does not stop the remaining ones.
+    per folder based on detect_technique(). Impedance (EIS) folders and
+    folders matching neither technique are skipped; a folder that fails
+    to analyze is reported and does not stop the remaining ones.
+    `gcd_basis` is passed to run_gcd() as the normalization convention.
 
     If `output_dir` is given and several measurements are found, each one
     writes to `output_dir/<path relative to cell_folder>` so results don't
@@ -291,6 +303,9 @@ def run_experiment(
         technique = detect_technique(sub)
         print(f"\n  [{rel}] -> detected technique: {technique}")
 
+        if technique == "eis":
+            print("    impedance measurement -- not analyzed by this pipeline, skipped.")
+            continue
         if technique == "unknown":
             log.warning("Skipping %s: could not determine technique from Output.txt content.", sub)
             continue
@@ -303,7 +318,7 @@ def run_experiment(
             if technique == "cv":
                 run(sub, output_dir=sub_out)
             else:
-                run_gcd(sub, output_dir=sub_out)
+                run_gcd(sub, output_dir=sub_out, basis=gcd_basis)
             ran += 1
         except Exception as exc:
             log.exception("Analysis failed for %s", sub)

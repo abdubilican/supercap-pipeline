@@ -77,7 +77,8 @@ def read_info_json(folder: Path) -> dict:
     if not info_files:
         raise FileNotFoundError(f"No info.json found in {folder}")
 
-    with open(info_files[0], encoding="utf-8") as fh:
+    # utf-8-sig: tolerate a BOM, which Windows editors/PowerShell often add
+    with open(info_files[0], encoding="utf-8-sig") as fh:
         return json.load(fh)
 
 

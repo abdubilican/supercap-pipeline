@@ -66,8 +66,13 @@ def test_run_experiment_dispatches_per_subfolder(tmp_path, monkeypatch):
     ])
     _write_output_txt(cell_folder / "02_Galvanostatic Polarization Method 2.5V(3)", [
         "0.0\t1\t20\tCC\tc\t0.0\t1.0",
+        "10.0\t1\t30\tCC\td\t2.5\t-1.0",
     ])
-    (cell_folder / "03_no_output_here").mkdir(parents=True)
+    _write_output_txt(cell_folder / "03_PEIS - Supercapacitor", [
+        "0.0\t1\t20\tCC\tc\t0.0\t1.0",
+        "10.0\t1\t30\tCC\td\t2.5\t-1.0",
+    ])
+    (cell_folder / "04_no_output_here").mkdir(parents=True)
 
     calls = {"cv": [], "gcd": []}
     monkeypatch.setattr(
@@ -76,13 +81,30 @@ def test_run_experiment_dispatches_per_subfolder(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "supercap_pipeline.pipeline.run_gcd",
-        lambda folder, output_dir=None: calls["gcd"].append(Path(folder).name),
+        lambda folder, output_dir=None, basis=None: calls["gcd"].append((Path(folder).name, basis)),
     )
 
-    run_experiment(cell_folder)
+    run_experiment(cell_folder, gcd_basis="total_active_mass")
 
     assert calls["cv"] == ["01_Cyclic Voltametry"]
-    assert calls["gcd"] == ["02_Galvanostatic Polarization Method 2.5V(3)"]
+    # PEIS folder is skipped even though it carries CC c/d rows
+    assert calls["gcd"] == [("02_Galvanostatic Polarization Method 2.5V(3)", "total_active_mass")]
+
+
+def test_detect_technique_eis_by_step_type(tmp_path):
+    folder = tmp_path / "03_some_step"
+    _write_output_txt(folder, [
+        "0.0\t1\t10\tPEIS\t-\t0.0\t0.0",
+        "0.1\t1\t20\tCC\tc\t0.0\t1.0",
+        "0.2\t1\t30\tCC\td\t0.1\t-1.0",
+    ])
+    assert detect_technique(folder) == "eis"
+
+
+def test_detect_technique_charge_only_is_not_gcd(tmp_path):
+    folder = tmp_path / "02_step"
+    _write_output_txt(folder, ["0.0\t1\t20\tCC\tc\t0.0\t1.0"])
+    assert detect_technique(folder) == "unknown"
 
 
 def test_run_experiment_finds_nested_measurements_from_experiment_root(tmp_path, monkeypatch):

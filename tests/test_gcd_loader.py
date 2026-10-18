@@ -74,3 +74,21 @@ def test_valid_config_loads(tmp_path):
     assert meta["basis"] == "total_active_mass"
     assert meta["mass_total_g"] == pytest.approx(0.02)
     assert len(df) == 2
+
+
+def test_explicit_basis_replaces_missing_gcd_config(tmp_path):
+    _write_experiment(tmp_path, _GOOD_FIELDS, gcd_config=None)
+    _, meta = load_gcd_experiment(tmp_path, basis="single_electrode")
+    assert meta["basis"] == "single_electrode"
+
+
+def test_explicit_basis_overrides_info_json(tmp_path):
+    _write_experiment(tmp_path, _GOOD_FIELDS, gcd_config={"basis": "cell"})
+    _, meta = load_gcd_experiment(tmp_path, basis="total_active_mass")
+    assert meta["basis"] == "total_active_mass"
+
+
+def test_invalid_explicit_basis_raises(tmp_path):
+    _write_experiment(tmp_path, _GOOD_FIELDS, gcd_config=None)
+    with pytest.raises(ValueError, match="basis"):
+        load_gcd_experiment(tmp_path, basis="per_banana")

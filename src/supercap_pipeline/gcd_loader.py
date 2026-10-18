@@ -35,7 +35,10 @@ VALID_BASES: set[str] = {"cell", "single_electrode", "total_active_mass"}
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_gcd_experiment(gcd_folder: str | Path) -> tuple[pd.DataFrame, dict]:
+def load_gcd_experiment(
+    gcd_folder: str | Path,
+    basis: str | None = None,
+) -> tuple[pd.DataFrame, dict]:
     """
     Load one GCD measurement folder.
 
@@ -44,6 +47,10 @@ def load_gcd_experiment(gcd_folder: str | Path) -> tuple[pd.DataFrame, dict]:
     gcd_folder : path to the folder containing Output.txt and *info.json
                  (optionally Output-Cycles.txt for the tester's own per-cycle
                  Qc/Qd/Wc/Wd/efficiency values, used as a cross-check only)
+    basis      : normalization convention chosen explicitly by the caller
+                 (e.g. `supercap-run --gcd-basis`). Overrides
+                 `gcdConfig.basis` in info.json; if both are absent, loading
+                 fails -- the convention is never guessed.
 
     Returns
     -------
@@ -55,7 +62,7 @@ def load_gcd_experiment(gcd_folder: str | Path) -> tuple[pd.DataFrame, dict]:
     """
     gcd_folder = Path(gcd_folder)
     info = read_info_json(gcd_folder)
-    meta = _build_meta(info, gcd_folder)
+    meta = _build_meta(info, gcd_folder, basis_override=basis)
     df   = _load_output_txt(gcd_folder)
     meta["tester_cycles"] = _load_tester_cycles(gcd_folder)
 
@@ -72,7 +79,7 @@ def load_gcd_experiment(gcd_folder: str | Path) -> tuple[pd.DataFrame, dict]:
 # Metadata (masses + normalization convention -- no defaults, hard errors)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_meta(info: dict, folder: Path) -> dict:
+def _build_meta(info: dict, folder: Path, basis_override: str | None = None) -> dict:
     cell_tag = info["testCell"]["cellTag"]
     exp_name = info["experiment"]["experimentName"]
 
@@ -110,19 +117,28 @@ def _build_meta(info: dict, folder: Path) -> dict:
             folder.name, rel_asymmetry * 100, m1, m2,
         )
 
-    gcd_config = info.get("gcdConfig")
-    if not gcd_config or "basis" not in gcd_config:
+    gcd_config = info.get("gcdConfig") or {}
+    file_basis = gcd_config.get("basis")
+    if basis_override is not None:
+        if file_basis is not None and file_basis != basis_override:
+            log.warning(
+                "%s: --gcd-basis=%s overrides gcdConfig.basis=%s from info.json.",
+                folder.name, basis_override, file_basis,
+            )
+        basis = basis_override
+    elif file_basis is not None:
+        basis = file_basis
+    else:
         raise ValueError(
-            f"{folder}: info.json has no `gcdConfig.basis` entry. "
-            "The normalization convention is mandatory and is never "
-            "defaulted -- add e.g. "
-            '`"gcdConfig": {"basis": "total_active_mass"}` '
+            f"{folder}: no normalization basis given. The convention is "
+            "mandatory and is never defaulted -- pass it on the command line, "
+            "e.g. `supercap-run <folder> --gcd-basis total_active_mass`, or add "
+            '`"gcdConfig": {"basis": "total_active_mass"}` to info.json '
             f"(one of {sorted(VALID_BASES)})."
         )
-    basis = gcd_config["basis"]
     if basis not in VALID_BASES:
         raise ValueError(
-            f"{folder}: gcdConfig.basis={basis!r} is not one of "
+            f"{folder}: GCD basis {basis!r} is not one of "
             f"{sorted(VALID_BASES)}."
         )
 
