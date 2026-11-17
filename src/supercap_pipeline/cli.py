@@ -28,9 +28,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "folder",
         help=(
-            "A measurement folder containing Output.txt and info.json "
-            "(e.g. '.../A7029/01_Cyclic Voltametry'), or any parent folder "
-            "(cell / cell group / experiment) -- all measurements below it are run."
+            "A measurement folder containing Output.txt or a PAT-Tester .xlsx export "
+            "(e.g. '.../A7029/01_Cyclic Voltametry'), any parent folder "
+            "(cell / cell group / experiment) -- all measurements below it are run -- "
+            "or a single CV export file (.xlsx / Output.txt)."
         ),
     )
     parser.add_argument(
@@ -61,8 +62,8 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     folder = Path(args.folder)
-    if not folder.is_dir():
-        parser.error(f"folder not found: {folder}")
+    if not folder.exists():
+        parser.error(f"folder or file not found: {folder}")
 
     run_experiment(folder, output_dir=args.output, gcd_basis=args.gcd_basis)
 

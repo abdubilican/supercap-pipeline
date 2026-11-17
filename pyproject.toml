@@ -1,12 +1,14 @@
 [project]
 name = "supercap-pipeline"
 version = "0.1.0"
-description = "Supercapacitor cyclic voltammetry analysis pipeline"
+description = "Supercapacitor CV / GCD analysis pipeline"
 requires-python = ">=3.11"
 dependencies = [
     "pandas>=2.2",
     "numpy>=1.26",
     "matplotlib>=3.9",
+    "openpyxl>=3.1",
+    "python-calamine>=0.2",
 ]
 
 [project.scripts]

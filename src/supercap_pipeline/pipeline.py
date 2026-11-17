@@ -13,11 +13,16 @@ applies, and runs both where present.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 
-from .loader       import load_experiment, read_tester_txt
-from .analysis     import compute_specific_capacitance, compute_mean_capacitance
-from .plots        import plot_cv_curves, plot_capacitance_vs_scanrate
+from . import cv_config
+from .loader       import read_tester_txt
+from .cv_io        import find_mass_file, is_cv_export, read_export, read_masses, sample_id_for
+from .cv_segmentation import detect_blocks, drop_transition_sweeps, find_sweeps, pair_cycles
+from .cv_analysis  import evaluate_blocks
+from .cv_output    import meta_table, results_table, summary_table, write_results
+from .plots        import plot_all
 from .gcd_loader   import load_gcd_experiment
 from .gcd_analysis import (
     segment_steps,
@@ -70,6 +75,10 @@ def detect_technique(folder: str | Path) -> str:
     folder = Path(folder)
     out_file = folder / "Output.txt"
     if not out_file.exists():
+        # xlsx export (sheet "Output"): only the CV pipeline reads these
+        for xlsx in xlsx_exports(folder):
+            if (read_export(xlsx)["type"] == "VS").any():
+                return "cv"
         return "unknown"
 
     df = read_tester_txt(out_file)
@@ -89,84 +98,126 @@ def run(
     output_dir: str | Path | None = None,
 ) -> None:
     """
-    Full analysis pipeline for one cyclic voltammetry measurement folder.
+    CV evaluation (lab guide method) for one measurement: a folder with
+    Output.txt and/or xlsx exports (sheet "Output"), or one export file.
+    Each xlsx export in a folder is evaluated; Output.txt only if the folder
+    has no xlsx export. Mass file: Input-Variables.txt next to the export.
 
-    Parameters
-    ----------
-    cv_folder  : path to the measurement folder (contains Output.txt + info.json)
-    output_dir : where to save CSVs and PDFs; defaults to
-                 <experiment_root>/output/<cell_group>/<cell_tag>/
+    Results go to <output root>/<sample-id>/cv/ where the output root is
+    `output_dir` or, by default, <parent of the measurement>/output/.
     """
-    cv_folder = Path(cv_folder)
-    output_dir = Path(output_dir) if output_dir is not None else _default_output_dir(cv_folder)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    cv_path = Path(cv_folder)
+    if cv_path.is_file():
+        exports = [cv_path]
+    else:
+        exports = xlsx_exports(cv_path) or [cv_path / "Output.txt"]
+    for export in exports:
+        run_cv_export(export, output_dir)
 
-    # ── 1. Load ───────────────────────────────────────────────────────────────
+
+def xlsx_exports(folder: Path) -> list[Path]:
+    """xlsx files in `folder` (not below) that have a sheet "Output"."""
+    return [p for p in sorted(folder.glob("*.xls[xm]")) if is_cv_export(p)]
+
+
+def run_cv_export(export: str | Path, output_dir: str | Path | None = None) -> dict:
+    """
+    Evaluate one export file:
+      read_masses -> read_export -> find_sweeps -> drop_transition_sweeps
+      -> pair_cycles -> detect_blocks -> evaluate_blocks (charges,
+      capacitance, quality checks) -> write_results + plots + cv.log.
+    Stops with an error if the masses are missing. Returns a dict with the
+    blocks, tables, output folder and written paths.
+    """
+    export = Path(export)
+    sample_id = sample_id_for(export)
+    measurement = export if export.suffix.lower() in (".xlsx", ".xlsm") else export.parent
+    root = Path(output_dir) if output_dir is not None else measurement.parent / "output"
+    out = root / sample_id / "cv"
+    out.mkdir(parents=True, exist_ok=True)
+
     print(f"\n{'-'*60}")
-    print(f"  Supercap CV Pipeline")
-    print(f"  Folder : {cv_folder}")
-    print(f"  Output : {output_dir}")
+    print("  Supercap CV Pipeline (lab-guide method)")
+    print(f"  Export : {export}")
+    print(f"  Output : {out}")
     print(f"{'-'*60}")
 
-    df, meta = load_experiment(cv_folder)
+    with _cv_log(out / "cv.log") as warnings:
+        try:
+            masses = read_masses(find_mass_file(export))
+            if abs(masses["m1_g"] - masses["m2_g"]) / masses["m_mean_g"] > cv_config.MASS_ASYMMETRY_TOL:
+                log_cv.warning("|m1 - m2| / m_mean > %.0f %%: C_el,exact = C*(1/m1 + 1/m2) "
+                               "is reported in addition to C_el",
+                               cv_config.MASS_ASYMMETRY_TOL * 100)
+            df = read_export(export)
+            sweeps = drop_transition_sweeps(find_sweeps(df))
+            cycles = detect_blocks(pair_cycles(sweeps))
+            blocks = evaluate_blocks(df, sweeps, cycles, masses)
+            if not blocks:
+                log_cv.warning("No evaluable CV block found in %s", export.name)
 
-    print(f"\n  Cell tag    : {meta['cell_tag']}")
-    print(f"  Experiment  : {meta['exp_name']}")
-    print(f"  Electrode 1 : {meta['e1_name']}  m1 = {meta['m1']*1000:.3f} mg")
-    if meta["m2"]:
-        print(f"  Electrode 2 : {meta['e2_name']}  m2 = {meta['m2']*1000:.3f} mg")
-    print(f"  Lightest m  : {meta['m_lightest']*1000:.3f} mg")
-    print(f"  Electrolyte : {meta['electrolyte']}")
+            results = results_table(blocks, sample_id, export.name)
+            summary = summary_table(blocks, sample_id, export.name)
+            meta = meta_table(masses, sample_id, str(export), sweeps.attrs.get("n_dropped", 0))
+            paths = plot_all(df, blocks, masses, sample_id, out / "plots")
+            paths = write_results(out, results, summary, meta, list(warnings)) + paths
+        except Exception as exc:
+            log_cv.error("Evaluation of %s stopped: %s", export.name, exc)
+            raise
 
-    vs_df = df[(df["type"] == "VS") & (df["cycle"] > 0)]
-    conditions = (
-        vs_df[["scan_speed_mVs", "voltage_window_V"]]
-        .dropna()
-        .drop_duplicates()
-        .sort_values(["voltage_window_V", "scan_speed_mVs"])
-    )
-    print(f"\n  Detected conditions ({len(conditions)}):")
-    for _, row in conditions.iterrows():
-        n_cyc = vs_df[
-            (vs_df["scan_speed_mVs"] == row["scan_speed_mVs"]) &
-            (vs_df["voltage_window_V"] == row["voltage_window_V"])
-        ]["cycle"].nunique()
-        print(f"    +/-{row['voltage_window_V']:.1f} V | {row['scan_speed_mVs']:.0f} mV/s | {n_cyc} cycles")
-
-    # ── 2. Analysis ───────────────────────────────────────────────────────────
-    print("\n  Computing specific capacitance per cycle …")
-    cap_df = compute_specific_capacitance(df, meta)
-
-    print(f"\n  Per-cycle C_sp [F/g]:")
-    print(cap_df.to_string(index=False))
-
-    mean_df = compute_mean_capacitance(cap_df, exclude_first_cycle=True)
-    print(f"\n  Mean C_sp (cycles 2–end) [F/g]:")
-    print(mean_df.to_string(index=False))
-
-    # Save CSVs
-    cap_df.to_csv(output_dir / "Csp_per_cycle.csv", index=False)
-    mean_df.to_csv(output_dir / "Csp_mean.csv", index=False)
-    print(f"\n  Saved CSVs -> {output_dir}")
-
-    # ── 3. Plots ──────────────────────────────────────────────────────────────
-    print("\n  Generating CV plots …")
-    cv_paths  = plot_cv_curves(df, meta, output_dir)
-    print(f"  Generating C_sp vs scan-rate plots …")
-    csp_paths = plot_capacitance_vs_scanrate(mean_df, cap_df, meta, output_dir)
-
-    all_paths = cv_paths + csp_paths
-    # Group by suffix for a tidy summary
-    by_ext: dict[str, list[str]] = {}
-    for p in all_paths:
-        by_ext.setdefault(p.suffix, []).append(p.name)
-    print(f"\n  Saved {len(all_paths)} files:")
-    for ext in sorted(by_ext):
-        print(f"    {ext}: {', '.join(sorted(by_ext[ext]))}")
-
-    print(f"\n{'-'*60}")
-    print("  Done.")
+    print(f"\n  m1 = {masses['m1_g'] * 1000:.4g} mg, m2 = {masses['m2_g'] * 1000:.4g} mg, "
+          f"m_mean = {masses['m_mean_g'] * 1000:.4g} mg  ({Path(masses['source']).name})")
+    print(f"  Sweeps: {len(sweeps)} kept, {sweeps.attrs.get('n_dropped', 0)} transition sweeps "
+          f"dropped; {len(cycles)} cycles; {len(blocks)} blocks\n")
+    if blocks:
+        cols = ["block", "occurrence", "window_type", "U_max_V", "nu_nom_mVs", "up_cycle",
+                "n_complete_cycles", "C_plus_F", "C_minus_F", "C_F", "C_el_Fg",
+                "eta_plus", "eta_minus", "flags"]
+        print(summary[cols].to_string(index=False, float_format=lambda x: f"{x:.4g}",
+                                      max_colwidth=80))
+    print(f"\n  Saved {len(paths)} files to {out}  (log: cv.log)")
     print(f"{'-'*60}\n")
+    return dict(blocks=blocks, results=results, summary=summary, meta=meta,
+                out=out, paths=paths, sweeps=sweeps, cycles=cycles, masses=masses)
+
+
+log_cv = logging.getLogger("supercap_pipeline.cv")
+
+
+class _WarningCollector(logging.Handler):
+    def __init__(self, sink: list[str]):
+        super().__init__(level=logging.WARNING)
+        self.sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.sink.append(record.getMessage())
+
+
+@contextmanager
+def _cv_log(path: Path):
+    """
+    Route every message of the CV modules (INFO and up: dropped sweeps,
+    unpaired sweeps, block decisions, flags, warnings) to `path`; warnings
+    also go to the console and to the yielded list (-> Warnings sheet).
+    """
+    logger = log_cv
+    old = (logger.level, logger.propagate, list(logger.handlers))
+    fh = logging.FileHandler(path, mode="w", encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+    console = logging.StreamHandler()
+    console.setLevel(logging.WARNING)
+    console.setFormatter(logging.Formatter("  %(levelname)s: %(message)s"))
+    sink: list[str] = []
+    logger.handlers = [fh, console, _WarningCollector(sink)]
+    logger.setLevel(logging.DEBUG if logging.getLogger().level <= logging.DEBUG else logging.INFO)
+    logger.propagate = False
+    try:
+        yield sink
+    finally:
+        fh.close()
+        logger.setLevel(old[0])
+        logger.propagate = old[1]
+        logger.handlers = old[2]
 
 
 def run_gcd(
@@ -266,7 +317,9 @@ def find_measurement_folders(root: str | Path) -> list[Path]:
     single-measurement folder alike.
     """
     root = Path(root)
-    return sorted({p.parent for p in root.rglob("Output.txt") if p.is_file()})
+    found = {p.parent for p in root.rglob("Output.txt") if p.is_file()}
+    found |= {p.parent for p in root.rglob("*.xls[xm]") if is_cv_export(p)}
+    return sorted(found)
 
 
 def run_experiment(
@@ -288,6 +341,9 @@ def run_experiment(
     default output directory.
     """
     cell_folder = Path(cell_folder)
+    if cell_folder.is_file():  # a single CV export (.xlsx or Output.txt)
+        run(cell_folder, output_dir=output_dir)
+        return
     measurements = find_measurement_folders(cell_folder)
 
     print(f"\n{'='*60}")
