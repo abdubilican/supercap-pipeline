@@ -1,361 +1,403 @@
 """
 gcd_plots.py
 ------------
-Generate all figures for a GCD (galvanostatic charge/discharge) analysis.
+Figures of the GCD evaluation (lab guide GCD 6.2), PNG (300 dpi) + SVG +
+Origin-ready xlsx (plot_excel), in output/<sample-id>/gcd/plots/:
 
-Figure set
-----------
-1. V12 vs t_cycle per rate stage (charge+discharge, one continuous curve per
-   cycle), slope-fit window and extrapolated IR-drop point marked on one
-   representative cycle, for visual QC.
-2. C_spec vs current density (both slope- and integral-method values),
-   mean +/- std per rate stage, log x-axis (rate studies convention).
-3. C_spec vs cycle number (both methods), points coloured by rate stage.
-4. Capacity retention per rate stage (both methods), relative to the
-   lowest-current rate stage.
-5. Ragone plot: specific power vs. specific energy, log-log.
-6. Coulomb/energy efficiency and ESR vs. cycle number.
+  gcd_profiles_time        V12 vs time in the cycle (selected cycle per rate block)
+  gcd_profiles_charge      V12 vs specific charge (mAh/g per m_mean), discharge runs back
+  gcd_rate_capability      C_el vs j (log x) + retention (second y-axis)
+  gcd_esr                  ESR vs j (log x)
+  gcd_ragone               E_sp vs P_sp (log-log), points labelled with j
+  gcd_cycling_retention    retention and ESR/ESR0 vs cycle (if a cycling test is present)
+  gcd_cycling_efficiency   eta_C vs cycle
+  gcd_floating_retention   retention and ESR/ESR0 vs hold time (if a floating test is present)
+  gcd_floating_efficiency  eta_C vs hold time
+  gcd_qc_<j>               QC plot per rate block (not in the guide): IR drop and U_min crossing
 
-Each figure is saved as both PDF and PNG, with a companion CSV holding the
-data it was drawn from -- same convention as plots.py (CV module), whose
-_save_fig() helper is reused here directly.
-
-Axis convention: every GCD plot's linear axes are forced to start at 0
-(`set_xlim(left=0)` / `set_ylim(bottom=0)`, upper bound autoscaled) -- this
-is a GCD-specific convention and is NOT applied to the CV module's plots
-(whose curves are centered on 0 by construction). The one exception is the
-C_spec-vs-current-density plot, which keeps its log x-axis (rate-study
-convention); only its y-axis is floored at 0.
+One fixed colour per current density in every figure (sequential palette,
+low j light -> high j dark).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from .gcd_analysis import step_frame
-from .plots import _save_fig
+from . import gcd_config as cfg
+from .gcd_segmentation import cluster_values
+from .plot_style import (
+    ACCENT, INK, MUTED, Column, Curve, PlotContext, save_figure, sequential_colors, style_axes,
+    subtitle,
+)
 
-# ── Consistent colour per rate stage (cycled if more stages than colours) ────
-RATE_COLORS: list[str] = ["#2563EB", "#16A34A", "#D97706", "#DC2626", "#7C3AED", "#0891B2"]
+PER_ELECTRODE = "per electrode, m̄ = (m1 + m2)/2"
+PER_TOTAL = "per total active mass, m1 + m2 = 2 m̄"
 
 
-def _color_for_rate(rate_group: int) -> str:
-    return RATE_COLORS[rate_group % len(RATE_COLORS)]
+def j_colors(js) -> callable:
+    """Colour function for current densities: clusters (1 %) -> sequential palette."""
+    js = np.asarray(list(js), dtype=float)
+    if len(js) == 0:
+        return lambda j: INK
+    labels = cluster_values(js)
+    reps = np.array([np.median(js[labels == k]) for k in range(labels.max() + 1)])
+    cols = sequential_colors(list(reps))
+    return lambda j: cols[float(reps[np.argmin(np.abs(reps - j))])]
+
+
+def _label(r) -> str:
+    occ = f" (occurrence {int(r['occurrence'])})" if r["occurrence"] > 1 else ""
+    return f"{r['j_block_Ag']:.3g} A/g, cycle {int(r['selected_cycle'])}{occ}"
+
+
+def _selected(rate: pd.DataFrame, ev: pd.DataFrame) -> list[tuple[dict, pd.Series]]:
+    if rate.empty or "selected_cycle" not in rate:
+        return []
+    by_cycle = ev.set_index("cycle")
+    return [(r, by_cycle.loc[int(r["selected_cycle"])])
+            for r in rate.sort_values("j_block_Ag").to_dict("records")
+            if np.isfinite(r["selected_cycle"])]
+
+
+def _cycles_text(sel) -> str:
+    return "; ".join(f"block {int(r['block'])}: cycle {int(r['selected_cycle'])}" for r, _ in sel)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public API
+# Rate series
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_gcd_curves(
-    df: pd.DataFrame,
-    cycle_df: pd.DataFrame,
-    steps_df: pd.DataFrame,
-    meta: dict,
-    output_dir: Path,
-) -> list[Path]:
+def plot_profiles_time(df, ev, rate, ctx: PlotContext, color) -> list[Path]:
+    """V12 vs time within the cycle (t = 0 at the start of the charge), selected cycles."""
+    sel = _selected(rate, ev)
+    if not sel:
+        return []
+    t, V = df["t"].to_numpy(dtype=float), df["V12"].to_numpy(dtype=float)
+    fig, ax = plt.subplots(figsize=(6.6, 4.6))
+    curves = []
+    for r, c in sel:
+        s = slice(int(c.ch_i0), int(c.dis_i1) + 1)
+        x = t[s] - t[int(c.ch_i0)]
+        ax.plot(x, V[s], color=color(r["j_block_Ag"]), linewidth=1.6, label=_label(r))
+        curves.append(Curve(_label(r), Column("Time in cycle", "s", x),
+                            [Column("Voltage", "V", V[s])]))
+    style_axes(ax)
+    ax.set_xlabel("Time from start of charge (s)")
+    ax.set_ylabel("Cell voltage V12 (V)")
+    ax.set_title("GCD profiles (selected cycle per current density)", loc="left")
+    ax.legend(title="j (A g⁻¹, per electrode)", frameon=False, fontsize=7)
+    subtitle(fig, ctx.sample_id, ctx.masses)
+    return save_figure(fig, ctx, "gcd_profiles_time", curves=curves, cycles_used=_cycles_text(sel),
+                       mass_basis={"x": "-", "y": "-", "legend_j": PER_ELECTRODE})
+
+
+def plot_profiles_charge(df, ev, rate, ctx: PlotContext, color) -> list[Path]:
     """
-    One figure per rate stage: V12 vs t_cycle (continuous through charge
-    THEN discharge, using the tester's own per-cycle clock) for every
-    complete cycle of that stage, slope-fit window shaded and IR-drop
-    extrapolation marked on the first non-OCV-flagged cycle. Axes start
-    at (0, 0).
-
-    Saves per figure: gcd_curves_rate<NN>.pdf/.png/.csv
+    V12 vs specific charge per m_mean [mAh/g]: charge x = Qcd/m_mean, then
+    (rest and) discharge x = (Q_ch + Qcd)/m_mean, so the curve runs back and
+    the gap at the end shows the charge lost in the cycle.
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cell_tag = meta["cell_tag"]
-    saved: list[Path] = []
-
-    rate_groups = sorted(cycle_df["rate_group"].unique())
-    for rg in rate_groups:
-        rg_cycles = cycle_df[cycle_df["rate_group"] == rg].sort_values("cycle")
-        color = _color_for_rate(int(rg))
-        base = output_dir / f"gcd_curves_rate{int(rg):02d}"
-
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        csv_rows = []
-
-        rep_row = None
-        for _, row in rg_cycles.iterrows():
-            cyc_steps = steps_df[steps_df["cycle"] == row["cycle"]]
-            charge_steps = cyc_steps[cyc_steps["kind"] == "charge"]
-            dis_steps = cyc_steps[cyc_steps["kind"] == "discharge"]
-            if charge_steps.empty or dis_steps.empty:
-                continue
-            charge_id = int(charge_steps.iloc[0]["step_id"])
-            dis_id = int(dis_steps.iloc[0]["step_id"])
-
-            cd_g = df.loc[df["step_id"].isin([charge_id, dis_id])].sort_values("t_cycle")
-            ax.plot(cd_g["t_cycle"], cd_g["V12"], color=color, linewidth=0.9, alpha=0.5)
-
-            tmp = cd_g[["t_cycle", "V12"]].copy()
-            tmp.insert(0, "cycle", row["cycle"])
-            tmp["phase"] = np.where(cd_g["step_id"] == charge_id, "charge", "discharge")
-            csv_rows.append(tmp)
-
-            if rep_row is None and not row["ocv_start"]:
-                rep_row = row
-                rep_dis_g = step_frame(df, dis_id)  # t_step-ordered, for the fit window
-
-        if rep_row is not None:
-            t_cycle_dis_start = float(rep_dis_g["t_cycle"].iloc[0])
-            lo, hi = rep_row["u_max_V"] * 0.40, rep_row["u_max_V"] * 0.80
-            ax.axhspan(lo, hi, color=color, alpha=0.12, label="slope-fit window")
-            n = int(rep_row["ir_n_points"])
-            first_pts = rep_dis_g.iloc[:n]
-            ax.scatter(first_pts["t_cycle"], first_pts["V12"], color="black", s=14, zorder=3,
-                       label="IR-drop fit points")
-            ax.scatter([t_cycle_dis_start], [rep_row["u_max_V"] - rep_row["ir_drop_V"]],
-                       marker="x", color="red", s=40, zorder=4,
-                       label=f"V0 extrap. (cycle {int(rep_row['cycle'])})")
-
-        ax.set_xlabel("t_cycle (s) -- charge then discharge")
-        ax.set_ylabel("V12 (V)")
-        ax.set_xlim(left=0)
-        ax.set_ylim(bottom=0)
-        ax.set_title(f"{cell_tag} - GCD charge/discharge curves, rate stage {int(rg)} "
-                     f"(I={rg_cycles['i_nominal_mA'].iloc[0]:.3f} mA, "
-                     f"{rg_cycles['current_density_Ag'].iloc[0]:.4f} A/g)")
-        ax.legend(loc="best", framealpha=0.8, fontsize=7)
-        ax.grid(True, alpha=0.25, linestyle=":")
-        fig.tight_layout()
-
-        if csv_rows:
-            csv_df = pd.concat(csv_rows, ignore_index=True)
-            csv_path = Path(str(base) + ".csv")
-            csv_df.to_csv(csv_path, index=False)
-            saved.append(csv_path)
-
-        pdf, png = _save_fig(fig, base)
-        plt.close(fig)
-        saved.extend([pdf, png])
-
-    return saved
+    sel = _selected(rate, ev)
+    if not sel:
+        return []
+    Q, V = df["Qcd"].to_numpy(dtype=float), df["V12"].to_numpy(dtype=float)
+    m = ctx.masses["m_mean_g"]
+    fig, ax = plt.subplots(figsize=(6.6, 4.6))
+    curves = []
+    for r, c in sel:
+        ch = slice(int(c.ch_i0), int(c.ch_i1) + 1)
+        after = slice(int(c.ch_i1) + 1, int(c.dis_i1) + 1)
+        x = np.r_[Q[ch], c.Q_ch + Q[after]] / m
+        y = np.r_[V[ch], V[after]]
+        ax.plot(x, y, color=color(r["j_block_Ag"]), linewidth=1.6, label=_label(r))
+        curves.append(Curve(_label(r), Column("Specific charge", "mAh/g", x),
+                            [Column("Voltage", "V", y)]))
+    style_axes(ax)
+    ax.set_xlabel("Specific charge (mAh g⁻¹, per electrode)")
+    ax.set_ylabel("Cell voltage V12 (V)")
+    ax.set_title("GCD profiles vs charge (gap at the end = charge lost)", loc="left")
+    ax.legend(title="j (A g⁻¹, per electrode)", frameon=False, fontsize=7)
+    subtitle(fig, ctx.sample_id, ctx.masses)
+    return save_figure(fig, ctx, "gcd_profiles_charge", curves=curves,
+                       cycles_used=_cycles_text(sel),
+                       mass_basis={"x": PER_ELECTRODE, "y": "-"})
 
 
-def plot_capacitance_vs_current_density(
-    cycle_df: pd.DataFrame,
-    output_dir: Path,
-    meta: dict,
-) -> list[Path]:
+def plot_rate_capability(ev, rate, ctx: PlotContext, color) -> list[Path]:
     """
-    C_spec (slope + integral method) vs. current density, log x-axis.
-    Saves: csp_vs_current_density.pdf/.png/.csv
+    C_el vs j (log x), markers + line; retention in % of the lowest j on the
+    second y-axis. Retention = C_el / C_el(lowest j), so the right axis is an
+    exact rescaling of the left one and both are read off the same curve.
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cell_tag = meta["cell_tag"]
-    base = output_dir / "csp_vs_current_density"
+    sel = _selected(rate, ev)
+    if not sel:
+        return []
+    j = np.array([r["j_block_Ag"] for r, _ in sel])
+    c_el = np.array([r["C_el"] for r, _ in sel])
+    ret = np.array([r.get("retention_pct", np.nan) for r, _ in sel])
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    ax.plot(j, c_el, color=INK, linewidth=1.5, zorder=2)
+    ax.scatter(j, c_el, c=[color(x) for x in j], s=64, edgecolors=INK, linewidths=0.8, zorder=3)
+    for x, y, rr in zip(j, c_el, ret):
+        ax.annotate(f"{rr:.1f} %", (x, y), textcoords="offset points", xytext=(6, 6),
+                    fontsize=7, color=INK)
+    style_axes(ax)
+    ax.set_xscale("log")
+    ax.set_xlabel("Current density j (A g⁻¹, per electrode)")
+    ax.set_ylabel("Specific capacitance (F g⁻¹, per electrode)")
+    ax.set_ylim(bottom=0, top=np.nanmax(c_el) * 1.1)
+    ok = np.isfinite(c_el) & np.isfinite(ret) & (ret > 0)
+    if ok.any():
+        c0 = float(c_el[ok][0] * 100.0 / ret[ok][0])       # C_el at 100 % retention
+        sec = ax.secondary_yaxis("right", functions=(lambda c: 100.0 * c / c0,
+                                                     lambda r: r * c0 / 100.0))
+        sec.set_ylabel("Retention (% of lowest j)")
+    ax.set_title("Rate capability", loc="left")
+    subtitle(fig, ctx.sample_id, ctx.masses)
+    curves = [Curve("rate series", Column("Current density", "A/g", j),
+                    [Column("Specific capacitance C_el", "F/g", c_el, "C_el"),
+                     Column("Retention", "%", ret, "retention vs lowest j")])]
+    return save_figure(fig, ctx, "gcd_rate_capability", curves=curves,
+                       cycles_used=_cycles_text(sel),
+                       mass_basis={"x": PER_ELECTRODE, "y_left": PER_ELECTRODE, "y_right": "-"})
 
-    df = cycle_df[~cycle_df["ocv_start"]].copy()
-    agg = (
-        df.groupby("rate_group")
-          .agg(current_density_Ag=("current_density_Ag", "mean"),
-               C_slope_mean=("C_spec_slope", "mean"), C_slope_std=("C_spec_slope", "std"),
-               C_int_mean=("C_spec_integral", "mean"), C_int_std=("C_spec_integral", "std"))
-          .reset_index()
-          .sort_values("current_density_Ag")
-    )
-    agg[["C_slope_std", "C_int_std"]] = agg[["C_slope_std", "C_int_std"]].fillna(0.0)
 
-    csv_path = Path(str(base) + ".csv")
-    df[["rate_group", "cycle", "current_density_Ag", "C_spec_slope", "C_spec_integral"]].to_csv(
-        csv_path, index=False
-    )
-
-    fig, ax = plt.subplots(figsize=(5.5, 4))
-    for _, row in df.iterrows():
-        ax.scatter(row["current_density_Ag"], row["C_spec_slope"], color="#2563EB", alpha=0.3, s=16)
-        ax.scatter(row["current_density_Ag"], row["C_spec_integral"], color="#D97706", alpha=0.3, s=16)
-
-    ax.errorbar(agg["current_density_Ag"], agg["C_slope_mean"], yerr=agg["C_slope_std"],
-                fmt="o-", color="#2563EB", capsize=4, label="slope method")
-    ax.errorbar(agg["current_density_Ag"], agg["C_int_mean"], yerr=agg["C_int_std"],
-                fmt="s-", color="#D97706", capsize=4, label="integral method")
-
-    basis = meta["basis"]
-    ax.set_xscale("log")  # log x-axis kept deliberately (rate-study convention)
+def plot_esr(ev, rate, ctx: PlotContext, color) -> list[Path]:
+    """ESR vs j (log x)."""
+    sel = _selected(rate, ev)
+    if not sel:
+        return []
+    j = np.array([r["j_block_Ag"] for r, _ in sel])
+    esr = np.array([r["ESR"] for r, _ in sel])
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    ax.plot(j, esr, color=INK, linewidth=1.5, zorder=2)
+    ax.scatter(j, esr, c=[color(x) for x in j], s=64, edgecolors=INK, linewidths=0.8, zorder=3)
+    style_axes(ax)
+    ax.set_xscale("log")
     ax.set_ylim(bottom=0)
-    ax.set_xlabel("Current density (A/g)")
-    ax.set_ylabel(f"Specific capacitance (F/g, basis={basis})")
-    ax.set_title(f"{cell_tag} - C_spec vs current density")
-    ax.legend(framealpha=0.8)
-    ax.grid(True, alpha=0.25, linestyle=":", which="both")
-    fig.tight_layout()
-
-    pdf, png = _save_fig(fig, base)
-    plt.close(fig)
-    return [csv_path, pdf, png]
+    ax.set_xlabel("Current density j (A g⁻¹, per electrode)")
+    ax.set_ylabel("ESR (Ω)")
+    ax.set_title("ESR from the IR drop at the start of the discharge", loc="left")
+    subtitle(fig, ctx.sample_id, ctx.masses)
+    curves = [Curve("ESR", Column("Current density", "A/g", j), [Column("ESR", "Ohm", esr)])]
+    return save_figure(fig, ctx, "gcd_esr", curves=curves, cycles_used=_cycles_text(sel),
+                       mass_basis={"x": PER_ELECTRODE, "y": "-"})
 
 
-def plot_capacitance_vs_cycle(
-    cycle_df: pd.DataFrame,
-    output_dir: Path,
-    meta: dict,
-) -> list[Path]:
-    """
-    C_spec (both methods) vs. cycle number, points coloured by rate stage.
-    Saves: csp_vs_cycle.pdf/.png/.csv
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cell_tag = meta["cell_tag"]
-    base = output_dir / "csp_vs_cycle"
-
-    df = cycle_df.sort_values("cycle")
-    csv_path = Path(str(base) + ".csv")
-    df[["cycle", "rate_group", "i_nominal_mA", "current_density_Ag",
-        "ocv_start", "C_spec_slope", "C_spec_integral"]].to_csv(csv_path, index=False)
-
-    colors = [_color_for_rate(int(rg)) for rg in df["rate_group"]]
-
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.scatter(df["cycle"], df["C_spec_slope"], c=colors, s=32, marker="o", label="slope method")
-    ax.scatter(df["cycle"], df["C_spec_integral"], c=colors, s=32, marker="^", label="integral method")
-
-    for rg, grp in df.groupby("rate_group"):
-        ax.axvspan(grp["cycle"].min() - 0.5, grp["cycle"].max() + 0.5,
-                   color=_color_for_rate(int(rg)), alpha=0.06)
-
-    basis = meta["basis"]
-    ax.set_xlabel("Cycle")
-    ax.set_ylabel(f"Specific capacitance (F/g, basis={basis})")
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
-    ax.set_title(f"{cell_tag} - C_spec vs cycle (shaded band = rate stage)")
-    ax.legend(framealpha=0.8, fontsize=8)
-    ax.grid(True, alpha=0.25, linestyle=":")
-    fig.tight_layout()
-
-    pdf, png = _save_fig(fig, base)
-    plt.close(fig)
-    return [csv_path, pdf, png]
-
-
-def plot_capacity_retention(
-    retention_df: pd.DataFrame,
-    output_dir: Path,
-    meta: dict,
-) -> list[Path]:
-    """
-    Capacity retention (%) per rate stage relative to the lowest-current
-    rate stage, both methods, as a bar chart.
-    Saves: capacity_retention.pdf/.png/.csv
-    (retention_df: output of gcd_analysis.compute_capacity_retention())
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cell_tag = meta["cell_tag"]
-    base = output_dir / "capacity_retention"
-
-    csv_path = Path(str(base) + ".csv")
-    retention_df.to_csv(csv_path, index=False)
-
-    x = np.arange(len(retention_df))
-    width = 0.35
-    colors = [_color_for_rate(int(rg)) for rg in retention_df["rate_group"]]
-
-    fig, ax = plt.subplots(figsize=(6, 4.5))
-    ax.bar(x - width / 2, retention_df["retention_slope_pct"], width,
-           label="slope method", color=colors, alpha=0.9)
-    ax.bar(x + width / 2, retention_df["retention_integral_pct"], width,
-           label="integral method", color=colors, alpha=0.5)
-
-    ax.axhline(100, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-    labels = [f"{rg}\n({i:.3f} A/g)" for rg, i in
-              zip(retention_df["rate_group"], retention_df["current_density_Ag"])]
-    ax.set_xticks(x, labels)
-    ax.set_ylabel("Capacity retention (%)")
-    ax.set_xlabel("Rate stage (current density)")
-    ax.set_ylim(bottom=0)
-    ax.set_title(f"{cell_tag} - Capacity retention vs. lowest rate stage")
-    ax.legend(framealpha=0.8, fontsize=8)
-    ax.grid(True, alpha=0.25, linestyle=":", axis="y")
-    fig.tight_layout()
-
-    pdf, png = _save_fig(fig, base)
-    plt.close(fig)
-    return [csv_path, pdf, png]
-
-
-def plot_ragone(
-    cycle_df: pd.DataFrame,
-    output_dir: Path,
-    meta: dict,
-) -> list[Path]:
-    """Specific power vs. specific energy (Ragone plot), log-log."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cell_tag = meta["cell_tag"]
-    base = output_dir / "ragone"
-
-    df = cycle_df[~cycle_df["ocv_start"]].copy()
-    csv_path = Path(str(base) + ".csv")
-    df[["rate_group", "cycle", "E_discharge_Whkg", "P_mean_Wkg", "P_max_Wkg"]].to_csv(
-        csv_path, index=False
-    )
-
-    fig, ax = plt.subplots(figsize=(5.5, 4))
-    for rg, grp in df.groupby("rate_group"):
-        ax.scatter(grp["E_discharge_Whkg"], grp["P_mean_Wkg"], color=_color_for_rate(int(rg)),
-                   s=30, label=f"rate {int(rg)}")
-
+def plot_ragone(ev, rate, ctx: PlotContext, color) -> list[Path]:
+    """E_sp vs P_sp, both log, one point per current density labelled with j."""
+    sel = _selected(rate, ev)
+    if not sel:
+        return []
+    j = np.array([r["j_block_Ag"] for r, _ in sel])
+    E = np.array([r["E_sp"] for r, _ in sel])
+    P = np.array([r["P_sp"] for r, _ in sel])
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    ax.plot(P, E, color=MUTED, linewidth=1.0, zorder=2)
+    ax.scatter(P, E, c=[color(x) for x in j], s=64, edgecolors=INK, linewidths=0.8, zorder=3)
+    for p, e, jj in zip(P, E, j):
+        ax.annotate(f"{jj:.3g} A/g", (p, e), textcoords="offset points", xytext=(6, 4),
+                    fontsize=7, color=INK)
+    style_axes(ax, zero_line=False)
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("Specific energy (Wh/kg)")
-    ax.set_ylabel("Mean specific power (W/kg)")
-    ax.set_title(f"{cell_tag} - Ragone plot")
-    ax.legend(framealpha=0.8, fontsize=8)
-    ax.grid(True, alpha=0.25, linestyle=":", which="both")
-    fig.tight_layout()
+    ax.set_xlabel("Specific power (W kg⁻¹, per total active mass)")
+    ax.set_ylabel("Specific energy (Wh kg⁻¹, per total active mass)")
+    ax.set_title("Ragone plot", loc="left")
+    subtitle(fig, ctx.sample_id, ctx.masses)
+    curves = [Curve("Ragone", Column("Specific power", "W/kg", P),
+                    [Column("Specific energy", "Wh/kg", E),
+                     Column("Current density", "A/g", j, "point label j (per electrode)")])]
+    return save_figure(fig, ctx, "gcd_ragone", curves=curves, cycles_used=_cycles_text(sel),
+                       mass_basis={"x": PER_TOTAL, "y": PER_TOTAL, "labels": PER_ELECTRODE})
 
-    pdf, png = _save_fig(fig, base)
-    plt.close(fig)
-    return [csv_path, pdf, png]
+
+def plot_qc(df, ev, r: dict, c: pd.Series, ctx: PlotContext) -> list[Path]:
+    """
+    QC plot of one rate block (not in the guide). Left: V12 around the current
+    reversal (time relative to the start of the discharge step, symlog), with
+    U_before and U1 marked and dU_IR, ESR, t_U1 annotated. Right: end of the
+    discharge with rows a/b and the interpolated U_min point.
+    """
+    t = df["t"].to_numpy(dtype=float)
+    TS = df["t_step"].to_numpy(dtype=float)
+    V = df["V12"].to_numpy(dtype=float)
+    rows = df["excel_row"].to_numpy()
+    d0, d1, pre = int(c.dis_i0), int(c.dis_i1), int(c.dis_i0) - 1
+    t_switch = t[d0] - TS[d0]
+    left = slice(max(int(c.ch_i0), pre - 5), min(d1, d0 + 6) + 1)
+    xl = (t[left] - t_switch) * 1000.0
+
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(11.0, 4.6))
+    a1.plot(xl, V[left], color=INK, marker="o", markersize=4, linewidth=1.2)
+    xp = np.array([(t[pre] - t_switch) * 1000.0, (t[d0] - t_switch) * 1000.0])
+    a1.plot(xp, [c.U_before, c.U1], linestyle="none", marker="o", markersize=9,
+            color=ACCENT, markeredgecolor="white", markeredgewidth=1.5, zorder=4)
+    a1.annotate("U_before", (xp[0], c.U_before), textcoords="offset points", xytext=(-8, -14),
+                ha="right", fontsize=7)
+    a1.annotate("U1", (xp[1], c.U1), textcoords="offset points", xytext=(-8, -4), ha="right",
+                fontsize=7)
+    a1.text(0.02, 0.04, f"U_before = {c.U_before:.6f} V (row {rows[pre]})\n"
+                        f"U1       = {c.U1:.6f} V (row {rows[d0]})\n"
+                        f"ΔU_IR = {c.dU_IR:.4f} V\nESR = {c.ESR:.3f} Ω "
+                        f"(ΔI = {c.dI_A * 1000:.4g} mA)\nt_U1 = {c.t_U1_ms:.2f} ms",
+            transform=a1.transAxes, fontsize=7.5, family="monospace", va="bottom")
+    a1.set_xscale("symlog", linthresh=10.0)
+    style_axes(a1, zero_line=False)
+    a1.set_xlabel("Time from start of discharge step (ms, symlog)")
+    a1.set_ylabel("Cell voltage V12 (V)")
+    a1.set_title("IR drop at the current reversal", loc="left", fontsize=10)
+
+    right = slice(max(d0, int(np.flatnonzero(rows == c.row_a)[0]) - 4)
+                  if c.row_a > 0 else d0, d1 + 1)
+    a2.plot(TS[right], V[right], color=INK, marker="o", markersize=4, linewidth=1.2)
+    a2.axhline(c.U_min, color=MUTED, linestyle="--", linewidth=1)
+    ab_x, ab_y = [], []
+    if c.row_a > 0:
+        for rr, name in ((c.row_a, "a"), (c.row_b, "b")):
+            k = int(np.flatnonzero(rows == rr)[0])
+            ab_x.append(TS[k])
+            ab_y.append(V[k])
+            a2.annotate(f"row {name} = {int(rr)}", (TS[k], V[k]), textcoords="offset points",
+                        xytext=(6, 6) if name == "a" else (-8, -12),
+                        ha="left" if name == "a" else "right", fontsize=7)
+        a2.plot([c.t_dis], [c.U_min], marker="D", markersize=9, color=ACCENT,
+                markeredgecolor="white", markeredgewidth=1.5, zorder=4,
+                label=f"interpolated U_min: t_dis = {c.t_dis:.2f} s, Q_dis = {c.Q_dis:.6f} mAh")
+        a2.legend(frameon=False, fontsize=7, loc="upper right")
+    style_axes(a2, zero_line=False)
+    a2.set_xlabel("t_step (s)")
+    a2.set_ylabel("Cell voltage V12 (V)")
+    a2.set_title(f"End of discharge, U_min = {c.U_min:.2f} V", loc="left", fontsize=10)
+    fig.suptitle(f"QC plot (not in the guide) — j = {r['j_block_Ag']:.3g} A/g, block "
+                 f"{int(r['block'])}, cycle {int(r['selected_cycle'])}", x=0.01, ha="left",
+                 y=0.93, fontsize=11)
+    subtitle(fig, ctx.sample_id, ctx.masses)
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+
+    curves = [Curve("around the reversal", Column("Time from start of discharge", "ms", xl),
+                    [Column("Voltage", "V", V[left])]),
+              Curve("U_before and U1", Column("Time from start of discharge", "ms", xp),
+                    [Column("Voltage", "V", [c.U_before, c.U1])]),
+              Curve("end of discharge", Column("t_step", "s", TS[right]),
+                    [Column("Voltage", "V", V[right])])]
+    if ab_x:
+        curves += [Curve("rows a and b", Column("t_step", "s", ab_x), [Column("Voltage", "V", ab_y)]),
+                   Curve("interpolated U_min point", Column("t_step", "s", [c.t_dis]),
+                         [Column("Voltage", "V", [c.U_min])])]
+    occ = f"_occ{int(r['occurrence'])}" if r["occurrence"] > 1 else ""
+    return save_figure(fig, ctx, f"gcd_qc_{r['j_block_Ag']:.3g}Ag{occ}", curves=curves,
+                       cycles_used=f"block {int(r['block'])}: cycle {int(r['selected_cycle'])}",
+                       mass_basis={"x": "-", "y": "-"})
 
 
-def plot_efficiency_esr_vs_cycle(
-    cycle_df: pd.DataFrame,
-    output_dir: Path,
-    meta: dict,
-) -> list[Path]:
-    """Coulomb/energy efficiency and ESR vs. cycle number (two subplots)."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cell_tag = meta["cell_tag"]
-    base = output_dir / "efficiency_esr_vs_cycle"
+# ─────────────────────────────────────────────────────────────────────────────
+# Long-term tests
+# ─────────────────────────────────────────────────────────────────────────────
 
-    df = cycle_df.sort_values("cycle")
-    csv_path = Path(str(base) + ".csv")
-    df[["cycle", "rate_group", "ocv_start", "coulomb_eff_charge", "energy_eff", "esr_Ohm"]].to_csv(
-        csv_path, index=False
-    )
+def _longterm_retention(table, xcol, xlabel, xunit, name, title, group, label_fn, eol_col,
+                        ctx: PlotContext, color) -> list[Path]:
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(6.8, 6.6), sharex=True)
+    curves = []
+    for key, g in table.groupby(group):
+        g = g.sort_values(xcol)
+        j = float(g["j_Ag"].median()) if "j_Ag" in g else float(g["j_block_Ag"].median())
+        lab = label_fn(key, j)
+        col = color(j)
+        a1.plot(g[xcol], g["retention_pct"], color=col, linewidth=1.4, marker="o",
+                markersize=3 if len(g) > 50 else 6, label=lab)
+        a2.plot(g[xcol], g["ESR_rel"], color=col, linewidth=1.4, marker="o",
+                markersize=3 if len(g) > 50 else 6)
+        eol = g[eol_col].iloc[0]
+        if np.isfinite(eol):
+            for a in (a1, a2):
+                a.axvline(eol, color=col, linestyle=":", linewidth=1.2)
+            a1.annotate(f"end of life {eol:.4g} {xunit}\n({g['eol_criterion'].iloc[0]})",
+                        (eol, cfg.EOL_RETENTION * 100), textcoords="offset points",
+                        xytext=(4, 6), fontsize=7)
+        curves.append(Curve(lab, Column(xlabel, xunit, g[xcol].to_numpy()),
+                            [Column("Retention", "%", g["retention_pct"].to_numpy()),
+                             Column("ESR increase ESR/ESR0", "-", g["ESR_rel"].to_numpy())]))
+    a1.axhline(cfg.EOL_RETENTION * 100, color=MUTED, linestyle="--", linewidth=1,
+               label=f"{cfg.EOL_RETENTION:.0%}")
+    a2.axhline(cfg.EOL_ESR, color=MUTED, linestyle="--", linewidth=1, label=f"{cfg.EOL_ESR:g}×")
+    for a in (a1, a2):
+        style_axes(a, zero_line=False)
+    a1.set_ylabel("Retention C/C0 (%)")
+    a2.set_ylabel("ESR / ESR0 (–)")
+    a2.set_xlabel(f"{xlabel} ({xunit})")
+    a1.set_title(title, loc="left")
+    a1.legend(frameon=False, fontsize=7)
+    a2.legend(frameon=False, fontsize=7)
+    subtitle(fig, ctx.sample_id, ctx.masses)
+    return save_figure(fig, ctx, name, curves=curves,
+                       mass_basis={"x": "-", "y": "-", "legend_j": PER_ELECTRODE})
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
-    colors = [_color_for_rate(int(rg)) for rg in df["rate_group"]]
 
-    ax1.scatter(df["cycle"], df["coulomb_eff_charge"] * 100, c=colors, s=24, label="Coulomb eff.")
-    ax1.scatter(df["cycle"], df["energy_eff"] * 100, c=colors, marker="^", s=24, label="Energy eff.")
-    ax1.set_ylabel("Efficiency (%)")
-    ax1.legend(framealpha=0.8, fontsize=8)
-    ax1.grid(True, alpha=0.25, linestyle=":")
+def _longterm_eff(table, xcol, xlabel, xunit, name, title, group, label_fn,
+                  ctx: PlotContext, color) -> list[Path]:
+    fig, ax = plt.subplots(figsize=(6.8, 4.4))
+    curves = []
+    for key, g in table.groupby(group):
+        g = g.sort_values(xcol)
+        j = float(g["j_Ag"].median()) if "j_Ag" in g else float(g["j_block_Ag"].median())
+        lab = label_fn(key, j)
+        ax.plot(g[xcol], g["eta_C"], color=color(j), linewidth=1.4, marker="o",
+                markersize=3 if len(g) > 50 else 6, label=lab)
+        curves.append(Curve(lab, Column(xlabel, xunit, g[xcol].to_numpy()),
+                            [Column("Coulombic efficiency", "-", g["eta_C"].to_numpy())]))
+    ax.axhline(cfg.ETA_C_WARN, color=MUTED, linestyle="--", linewidth=1,
+               label=f"η_C = {cfg.ETA_C_WARN}")
+    style_axes(ax, zero_line=False)
+    ax.set_xlabel(f"{xlabel} ({xunit})")
+    ax.set_ylabel("Coulombic efficiency η_C (–)")
+    ax.set_title(title, loc="left")
+    ax.legend(frameon=False, fontsize=7)
+    subtitle(fig, ctx.sample_id, ctx.masses)
+    return save_figure(fig, ctx, name, curves=curves,
+                       mass_basis={"x": "-", "y": "-", "legend_j": PER_ELECTRODE})
 
-    ax2.scatter(df["cycle"], df["esr_Ohm"] * 1000, c=colors, s=24)
-    ax2.set_ylabel("ESR (mOhm)")
-    ax2.set_xlabel("Cycle")
-    ax2.grid(True, alpha=0.25, linestyle=":")
 
-    fig.suptitle(f"{cell_tag} - Efficiency & ESR vs. cycle")
-    fig.tight_layout()
+def plot_cycling(cyc_table: pd.DataFrame, ctx: PlotContext, color) -> list[Path]:
+    if cyc_table.empty:
+        return []
+    lab = lambda b, j: f"block {b}, {j:.3g} A/g"  # noqa: E731
+    return (_longterm_retention(cyc_table, "cycle_in_block", "Cycle number", "cycles",
+                                "gcd_cycling_retention", "Cycling test", "block", lab,
+                                "eol_cycle", ctx, color)
+            + _longterm_eff(cyc_table, "cycle_in_block", "Cycle number", "cycles",
+                            "gcd_cycling_efficiency", "Cycling test: coulombic efficiency",
+                            "block", lab, ctx, color))
 
-    pdf, png = _save_fig(fig, base)
-    plt.close(fig)
-    return [csv_path, pdf, png]
+
+def plot_floating(fl_table: pd.DataFrame, ctx: PlotContext, color) -> list[Path]:
+    if fl_table.empty:
+        return []
+    t = fl_table.assign(j_group=cluster_values(fl_table["j_block_Ag"].to_numpy()))
+    lab = lambda k, j: f"check-ups at {j:.3g} A/g"  # noqa: E731
+    return (_longterm_retention(t, "hold_time_h", "Hold time", "h", "gcd_floating_retention",
+                                "Floating test", "j_group", lab, "eol_hold_time_h", ctx, color)
+            + _longterm_eff(t, "hold_time_h", "Hold time", "h", "gcd_floating_efficiency",
+                            "Floating test: coulombic efficiency", "j_group", lab, ctx, color))
+
+
+def plot_all(df, ev, rate, cyc_table, fl_table, ctx: PlotContext) -> list[Path]:
+    """All GCD figures of lab guide 6.2 (+ QC plots); returns the saved paths."""
+    if ev.empty:
+        return []
+    color = j_colors(ev.groupby("block")["j_block_Ag"].first())
+    paths = []
+    paths += plot_profiles_time(df, ev, rate, ctx, color)
+    paths += plot_profiles_charge(df, ev, rate, ctx, color)
+    paths += plot_rate_capability(ev, rate, ctx, color)
+    paths += plot_esr(ev, rate, ctx, color)
+    paths += plot_ragone(ev, rate, ctx, color)
+    paths += plot_cycling(cyc_table, ctx, color)
+    paths += plot_floating(fl_table, ctx, color)
+    for r, c in _selected(rate, ev):
+        paths += plot_qc(df, ev, r, c, ctx)
+    return paths

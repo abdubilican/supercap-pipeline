@@ -1,786 +1,496 @@
 """
 gcd_analysis.py
 ---------------
-Compute galvanostatic charge/discharge (GCD) cycle metrics from the raw
-Output.txt DataFrame produced by gcd_loader.load_gcd_experiment().
+Evaluation of GCD cycles (lab guide GCD sections 3-5): IR drop and ESR,
+interpolation at U_min, charges/energies from Qcd and W12, capacitance,
+energy, power, efficiencies, quality checks, rate summary, comparison with
+CV, and the long-term (cycling / floating) evaluation.
 
-Pipeline of this module
-------------------------
-1. segment_steps()       -- group rows into (cycle, step) steps, classify
-                             each as charge/discharge/rest/other, drop the
-                             trailing incomplete step at file end.
-2. flag_ocv_start()       -- flag the very first charge step if it starts
-                             far from 0V (OCV rest beforehand, not a fully
-                             discharged cell) -> excluded from aggregates.
-3. assign_rate_stages()   -- cluster cycles by |I12| into rate stages
-                             (~2% relative tolerance).
-4. per discharge step:
-     compute_ir_drop()            -- ESR / IR-drop via linear extrapolation
-     compute_capacitance_slope()  -- IEC 62391 slope method
-     compute_capacitance_integral() -- C = 2*I*INT(U dt)/U_eff^2
-     compute_energy_power()       -- E, P_mean, P_max
-     compute_efficiencies()       -- vs. the preceding charge step
-     compute_three_electrode()    -- if V1R/V2R present
-     compute_relaxation()         -- voltage recovery during a following Rest
-5. compute_gcd_cycle_table()  -- orchestrates the above into one tidy
-                                  DataFrame, one row per complete cycle.
-6. compute_gcd_rate_aggregate() -- mean +/- std per rate stage.
-7. build_qc_report()          -- text summary of everything worth a human's
-                                  attention (dropped steps, over-flags, low
-                                  fit quality, implausible efficiencies, ...).
+All per-cycle quantities are computed in one vectorised pass over index
+arrays (start/end row of every half-cycle, crossing rows a/b), so files
+with tens of thousands of cycles need no Python loop over rows.
 
-Units & normalization
-----------------------
-Internally everything stays in the tester's native units (mA, V, s, mWh,
-mW) -- only compute_gcd_cycle_table() converts to the reported specific
-units at the very end, using meta["basis"] (REQUIRED, no default):
-
-    basis == "single_electrode" : C_spec = 2*C_cell / m_one_electrode
-    basis == "total_active_mass": C_spec = 4*C_cell / m_total
-    basis == "cell"             : C_spec =   C_cell / m_total
-
-Specific energy/power/current density use the same normalizing mass as
-capacitance (m_one_electrode for "single_electrode", m_total otherwise),
-without the 2x/4x capacitance doubling factor (that factor only converts
-cell capacitance to electrode capacitance; current/energy are not doubled).
-Because 1 mWh/g == 1 Wh/kg and 1 mW/g == 1 W/kg numerically, dividing the
-tester's native mWh/mW values by grams directly yields Wh/kg and W/kg.
+Units: I12 in mA, V12 in V, Qcd in mAh, W12 in mWh, t/t_step in s,
+masses in g. m_mean = (m1 + m2) / 2.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-log = logging.getLogger(__name__)
+from . import gcd_config as cfg
+from .gcd_segmentation import CYCLING, FLOATING, HOLD, RATE, cluster_values
 
-# ── Configurable defaults (all overridable via function kwargs) ─────────────
-DEFAULT_IR_N_POINTS           = 4        # IEC/lab practice: 3-5 points
-DEFAULT_SLOPE_WINDOW          = (0.40, 0.80)  # fraction of U_max, IEC 62391
-DEFAULT_MIN_SLOPE_POINTS      = 5
-DEFAULT_OCV_TOL_V             = 0.05
-DEFAULT_RATE_CLUSTER_TOL      = 0.02     # 2% relative
-DEFAULT_V_CONSISTENCY_TOL_V   = 0.01
-DEFAULT_R2_WARN_THRESHOLD     = 0.98
-DEFAULT_LINEARITY_WARN_THRESHOLD = 0.10  # 10% relative |slope-integral| dev
-DEFAULT_COULOMB_EFF_PLAUSIBLE = (0.80, 1.05)
+log = logging.getLogger("supercap_pipeline.gcd").getChild("analysis")
+
+FLAG, WARNING, INFO = "flag", "warning", "info"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step segmentation & classification
+# Interpolation at U_min and IR drop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def classify_step(type_: str, c_d: str) -> str:
-    if type_ == "Rest":
-        return "rest"
-    if type_ == "CC" and c_d == "c":
-        return "charge"
-    if type_ == "CC" and c_d == "d":
-        return "discharge"
-    return "other"
-
-
-def segment_steps(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def interpolate_at(u, V_a, V_b, X_a, X_b):
     """
-    Group the raw GCD DataFrame into contiguous (cycle, step) steps.
-
-    Returns
-    -------
-    df       : copy of `df`, sorted by t, with an added integer `step_id`
-               column (0..N-1, chronological order of first appearance)
-    steps_df : one row per step_id: step_id, cycle, step, type, c_d, kind,
-               n_points, t_start, t_end, duration_s, i_mean_mA,
-               i_abs_mean_mA, complete (bool).
-
-    The step containing the LAST row of the file is marked complete=False
-    (the data stream can end mid-step) and is excluded from every
-    downstream per-cycle metric. This is logged as a warning.
+    Linear interpolation at the voltage u (lab guide 3.2):
+        X(u) = X_a + (u - V_a) * (X_b - X_a) / (V_b - V_a)
+    used for X = Qcd, W12 and t_step between rows a and b of the U_min crossing.
     """
-    df = df.sort_values("t").reset_index(drop=True).copy()
-
-    new_step = (df["cycle"] != df["cycle"].shift()) | (df["step"] != df["step"].shift())
-    df["step_id"] = new_step.cumsum() - 1
-
-    rows = []
-    for step_id, g in df.groupby("step_id", sort=True):
-        rows.append(dict(
-            step_id       = int(step_id),
-            cycle         = int(g["cycle"].iloc[0]),
-            step          = int(g["step"].iloc[0]),
-            type          = g["type"].iloc[0],
-            c_d           = g["c/d"].iloc[0],
-            kind          = classify_step(g["type"].iloc[0], g["c/d"].iloc[0]),
-            n_points      = len(g),
-            t_start       = float(g["t"].iloc[0]),
-            t_end         = float(g["t"].iloc[-1]),
-            duration_s    = float(g["t"].iloc[-1] - g["t"].iloc[0]),
-            i_mean_mA     = float(g["I12"].mean()),
-            i_abs_mean_mA = float(g["I12"].abs().mean()),
-        ))
-    steps_df = pd.DataFrame(rows)
-    steps_df["complete"] = True
-
-    last_step_id = int(df["step_id"].iloc[-1])
-    steps_df.loc[steps_df["step_id"] == last_step_id, "complete"] = False
-
-    dropped = steps_df[~steps_df["complete"]]
-    for _, r in dropped.iterrows():
-        log.warning(
-            "Dropping incomplete trailing step cycle=%d step=%d (%s, c/d=%s): "
-            "file ends mid-step (%d points, %.3fs).",
-            r["cycle"], r["step"], r["type"], r["c_d"], r["n_points"], r["duration_s"],
-        )
-    return df, steps_df
+    return X_a + (u - V_a) * (X_b - X_a) / (V_b - V_a)
 
 
-def flag_ocv_start(
-    df: pd.DataFrame,
-    steps_df: pd.DataFrame,
-    tol_v: float = DEFAULT_OCV_TOL_V,
-) -> pd.DataFrame:
+def find_crossing(V: np.ndarray, u_min: float) -> tuple[int, int] | None:
     """
-    Flag the very first charge step if V12 at its start is not within
-    `tol_v` of 0V -- it began from an open-circuit voltage, not a fully
-    discharged cell, so its charge/discharge pair must be excluded from
-    aggregate statistics (kept, flagged, in the per-cycle table).
+    U_min crossing of one discharge (lab guide 3.2): b = the first row with
+    V12 <= U_min, a = b - 1 (the last row with V12 > U_min before it).
+    Rows after b are ignored (e.g. points slightly below U_min at the end).
+    Returns (a, b) as positions in V, or None if the discharge never reaches
+    U_min (or already starts below it).
     """
-    steps_df = steps_df.copy()
-    steps_df["ocv_start"] = False
-
-    charge_steps = steps_df[steps_df["kind"] == "charge"].sort_values("step_id")
-    if charge_steps.empty:
-        return steps_df
-
-    first = charge_steps.iloc[0]
-    v0 = float(df.loc[df["step_id"] == first["step_id"], "V12"].iloc[0])
-    if abs(v0) > tol_v:
-        steps_df.loc[steps_df["step_id"] == first["step_id"], "ocv_start"] = True
-        log.info(
-            "First charge step (cycle=%d) starts at V12=%.3fV (tol=%.3fV): "
-            "flagged ocv_start, excluded from aggregate statistics.",
-            first["cycle"], v0, tol_v,
-        )
-    return steps_df
-
-
-def assign_rate_stages(
-    steps_df: pd.DataFrame,
-    tol: float = DEFAULT_RATE_CLUSTER_TOL,
-) -> pd.DataFrame:
-    """
-    Cluster cycles by their (complete) charge step's mean |I12| into rate
-    stages, using a greedy 1D clustering on sorted currents with `tol`
-    relative tolerance between consecutive cluster members.
-
-    Adds `rate_group` (int, ascending by current) and `i_nominal_mA`
-    (cluster median) to every step belonging to that cycle.
-    """
-    steps_df = steps_df.copy()
-    charge = steps_df[(steps_df["kind"] == "charge") & steps_df["complete"]]
-    charge = charge.sort_values("i_abs_mean_mA")
-
-    clusters: list[list[int]] = []
-    cluster_currents: list[list[float]] = []
-    for _, row in charge.iterrows():
-        i = row["i_abs_mean_mA"]
-        if clusters and abs(i - cluster_currents[-1][-1]) / cluster_currents[-1][-1] <= tol:
-            clusters[-1].append(int(row["cycle"]))
-            cluster_currents[-1].append(i)
-        else:
-            clusters.append([int(row["cycle"])])
-            cluster_currents.append([i])
-
-    cycle_to_group: dict[int, int] = {}
-    cycle_to_inom: dict[int, float] = {}
-    for gi, (cyc_list, i_list) in enumerate(zip(clusters, cluster_currents)):
-        i_nom = float(np.median(i_list))
-        for c in cyc_list:
-            cycle_to_group[c] = gi
-            cycle_to_inom[c] = i_nom
-
-    steps_df["rate_group"]   = steps_df["cycle"].map(cycle_to_group)
-    steps_df["i_nominal_mA"] = steps_df["cycle"].map(cycle_to_inom)
-    return steps_df
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Low-level numerics
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _linfit(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
-    """OLS line fit y = a + b*x. Returns (intercept a, slope b, R^2)."""
-    b, a = np.polyfit(x, y, 1)
-    y_pred = a + b * x
-    ss_res = float(np.sum((y - y_pred) ** 2))
-    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    return float(a), float(b), r2
-
-
-def step_frame(df: pd.DataFrame, step_id: int) -> pd.DataFrame:
-    return df.loc[df["step_id"] == step_id].sort_values("t_step")
-
-
-def _step_integrals(g: pd.DataFrame) -> dict:
-    """Shared trapezoidal integrals for one step's (t_step, V12, I12)."""
-    t = g["t_step"].to_numpy(dtype=float)
-    v = g["V12"].to_numpy(dtype=float)
-    i_abs = g["I12"].abs().to_numpy(dtype=float)
-
-    duration_s      = float(t[-1] - t[0])
-    i_mean_mA       = float(i_abs.mean())
-    integral_v_dt_Vs = float(np.trapezoid(v, t))
-    q_mAh           = float(np.trapezoid(i_abs, t) / 3600.0)
-    e_mWh           = float(i_mean_mA * integral_v_dt_Vs / 3600.0)
-
-    return dict(
-        duration_s=duration_s, i_mean_mA=i_mean_mA,
-        integral_v_dt_Vs=integral_v_dt_Vs, q_mAh=q_mAh, e_mWh=e_mWh,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# IR-drop / ESR
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_ir_drop(
-    df: pd.DataFrame,
-    steps_df: pd.DataFrame,
-    step_id: int,
-    n_points: int = DEFAULT_IR_N_POINTS,
-) -> dict:
-    """
-    IR-drop at the start of `step_id` (normally a discharge step): fit a
-    line through the first `n_points` (V12 vs t_step) and extrapolate to
-    t_step=0 -- this is the cell voltage right at current reversal, before
-    the first (unreliable, coarse-sampled) measured point.
-
-    ΔU_IR = V(end of the immediately preceding step) - V0_extrapolated.
-    ESR variant is derived from the preceding step's kind: a direct charge
-    -> discharge reversal changes the current by 2*|I| (ESR = ΔU/(2|I|));
-    a Rest step in between changes it by only |I| (ESR = ΔU/|I|).
-    """
-    g = step_frame(df, step_id)
-    n = min(n_points, len(g))
-    if n < 2:
-        raise ValueError(f"step_id={step_id}: not enough points for IR-drop fit (n={n}).")
-
-    t = g["t_step"].to_numpy(dtype=float)[:n]
-    v = g["V12"].to_numpy(dtype=float)[:n]
-    v0_extrap, _slope, r2 = _linfit(t, v)
-
-    prev_rows = steps_df[steps_df["step_id"] == step_id - 1]
-    if prev_rows.empty:
-        raise ValueError(f"step_id={step_id}: no preceding step (file starts here).")
-    prev = prev_rows.iloc[0]
-    prev_g = step_frame(df, int(prev["step_id"]))
-    v_prev_end = float(prev_g["V12"].iloc[-1])
-
-    i_dis_mA = float(g["I12"].mean())
-    ir_drop_V = v_prev_end - v0_extrap
-
-    if prev["kind"] == "rest":
-        esr_variant = "from_rest"
-        denom_mA = abs(i_dis_mA)
-    else:
-        esr_variant = "direct_reversal"
-        denom_mA = 2.0 * abs(i_dis_mA)
-    esr_Ohm = abs(ir_drop_V) / (denom_mA / 1000.0) if denom_mA > 0 else np.nan
-
-    return dict(
-        step_id=step_id, v0_extrap_V=v0_extrap, ir_fit_r2=r2, ir_n_points=n,
-        v_prev_end_V=v_prev_end, prev_step_id=int(prev["step_id"]), prev_kind=prev["kind"],
-        ir_drop_V=ir_drop_V, esr_variant=esr_variant, esr_Ohm=esr_Ohm,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Capacitance
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_capacitance_slope(
-    df: pd.DataFrame,
-    step_id: int,
-    u_max_V: float,
-    window: tuple[float, float] = DEFAULT_SLOPE_WINDOW,
-    min_points: int = DEFAULT_MIN_SLOPE_POINTS,
-) -> dict:
-    """
-    IEC 62391 slope method: C = |I| / |dV/dt|, linear regression of V12 vs
-    t_step over the window where V falls within
-    [window[0]*u_max_V, window[1]*u_max_V].
-
-    `u_max_V` is the reference voltage (normally the charge step's terminal
-    voltage, i.e. `compute_ir_drop(...)["v_prev_end_V"]`) -- shared with
-    compute_capacitance_integral() so both methods use the same reference.
-    """
-    g = step_frame(df, step_id)
-    lo, hi = window[0] * u_max_V, window[1] * u_max_V
-    sub = g.loc[(g["V12"] >= lo) & (g["V12"] <= hi)]
-    i_mA = float(g["I12"].abs().mean())
-
-    if len(sub) < min_points:
-        log.warning(
-            "step_id=%d: slope-method window [%.0f%%..%.0f%% Umax] has only "
-            "%d points (< %d) -- capacitance unreliable.",
-            step_id, window[0] * 100, window[1] * 100, len(sub), min_points,
-        )
-        return dict(c_slope_F=np.nan, slope_r2=np.nan, n_points_used=len(sub),
-                    window_lo_V=lo, window_hi_V=hi)
-
-    t = sub["t_step"].to_numpy(dtype=float)
-    v = sub["V12"].to_numpy(dtype=float)
-    _a, b, r2 = _linfit(t, v)
-    c_slope_F = (i_mA / 1000.0) / abs(b) if b != 0 else np.nan
-
-    return dict(c_slope_F=c_slope_F, slope_r2=r2, n_points_used=len(sub),
-                window_lo_V=lo, window_hi_V=hi)
-
-
-def compute_capacitance_integral(
-    df: pd.DataFrame,
-    step_id: int,
-    u_max_V: float,
-    ir_drop_V: float,
-) -> dict:
-    """
-    Integral method: C = 2*|I| * INT(U dt) / U_eff^2, U_eff = u_max_V - ir_drop_V.
-    """
-    g = step_frame(df, step_id)
-    integ = _step_integrals(g)
-    u_eff_V = u_max_V - ir_drop_V
-
-    if u_eff_V <= 0:
-        c_integral_F = np.nan
-    else:
-        c_integral_F = 2.0 * (integ["i_mean_mA"] / 1000.0) * integ["integral_v_dt_Vs"] / (u_eff_V ** 2)
-
-    return dict(c_integral_F=c_integral_F, u_eff_V=u_eff_V, **integ)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Energy / power
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_energy_power(
-    df: pd.DataFrame,
-    step_id: int,
-    esr_Ohm: float,
-    u_eff_V: float,
-) -> dict:
-    """
-    E = |I| * INT(U dt) (already computed by _step_integrals as e_mWh),
-    P_mean = E / t_dis, P_max = U_eff^2 / (4*ESR).
-    """
-    g = step_frame(df, step_id)
-    integ = _step_integrals(g)
-
-    p_mean_mW = (integ["e_mWh"] * 3600.0 / integ["duration_s"]) if integ["duration_s"] > 0 else np.nan
-    if esr_Ohm and esr_Ohm > 0 and not np.isnan(esr_Ohm):
-        p_max_mW = (u_eff_V ** 2) / (4.0 * esr_Ohm) * 1000.0
-    else:
-        p_max_mW = np.nan
-
-    return dict(e_mWh=integ["e_mWh"], p_mean_mW=p_mean_mW, p_max_mW=p_max_mW,
-                duration_s=integ["duration_s"])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Efficiencies (discharge vs. the immediately preceding charge)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_efficiencies(
-    df: pd.DataFrame,
-    charge_step_id: int,
-    discharge_step_id: int,
-) -> dict:
-    ic   = _step_integrals(step_frame(df, charge_step_id))
-    idis = _step_integrals(step_frame(df, discharge_step_id))
-
-    coulomb_eff_time   = idis["duration_s"] / ic["duration_s"] if ic["duration_s"] > 0 else np.nan
-    coulomb_eff_charge = idis["q_mAh"] / ic["q_mAh"] if ic["q_mAh"] > 0 else np.nan
-    energy_eff         = idis["e_mWh"] / ic["e_mWh"] if ic["e_mWh"] > 0 else np.nan
-
-    return dict(
-        t_charge_s=ic["duration_s"], t_discharge_s=idis["duration_s"],
-        coulomb_eff_time=coulomb_eff_time, coulomb_eff_charge=coulomb_eff_charge,
-        q_charge_mAh=ic["q_mAh"], q_discharge_mAh=idis["q_mAh"],
-        e_charge_mWh=ic["e_mWh"], e_discharge_mWh=idis["e_mWh"],
-        energy_eff=energy_eff,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Three-electrode (working/counter vs. reference)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_three_electrode(
-    df: pd.DataFrame,
-    step_id: int,
-    u_max_V: float,
-    window: tuple[float, float] = DEFAULT_SLOPE_WINDOW,
-    min_points: int = DEFAULT_MIN_SLOPE_POINTS,
-    v_consistency_tol_V: float = DEFAULT_V_CONSISTENCY_TOL_V,
-) -> dict | None:
-    """
-    Working/counter electrode capacitance (slope method on V1R/V2R, same
-    window as the cell-level slope method) + potential windows. Returns
-    None if V1R/V2R are entirely NaN for this step (no reference electrode).
-    Warns (does not raise) if V12 != V1R - V2R beyond tolerance.
-    """
-    g = step_frame(df, step_id)
-    if g["V1R"].isna().all() or g["V2R"].isna().all():
+    hit = np.flatnonzero(np.asarray(V, dtype=float) <= u_min)
+    if len(hit) == 0 or hit[0] == 0:
         return None
+    return int(hit[0] - 1), int(hit[0])
 
-    i_mA = float(g["I12"].abs().mean())
-    lo, hi = window[0] * u_max_V, window[1] * u_max_V
-    mask = (g["V12"] >= lo) & (g["V12"] <= hi)
-    sub = g.loc[mask]
 
-    def _slope_c(col: str) -> tuple[float, float, int]:
-        if len(sub) < min_points:
-            return np.nan, np.nan, len(sub)
-        t = sub["t_step"].to_numpy(dtype=float)
-        v = sub[col].to_numpy(dtype=float)
-        _a, b, r2 = _linfit(t, v)
-        c = (i_mA / 1000.0) / abs(b) if b != 0 else np.nan
-        return c, r2, len(sub)
+def ir_drop(U_before: float, U1: float, I_before_mA: float, I_dis_mA: float) -> tuple[float, float]:
+    """
+    IR drop and ESR at the start of the discharge (lab guide 3.1):
+        dU_IR = U_before - U1
+        ESR   = dU_IR / dI,   dI = |I_before - I_discharge| [A]
+    U_before = V12 in the last row before the discharge (end of the charge,
+    or end of a rest step), U1 = V12 in the first discharge row. With direct
+    switching (no rest) I_before = +|I| and dI = 2|I|; after a rest
+    I_before = 0 and dI = |I|. I_discharge = median I12 of the discharge.
+    Returns (dU_IR [V], ESR [Ohm]).
+    """
+    du = U_before - U1
+    di = abs(I_before_mA - I_dis_mA) / 1000.0
+    return du, du / di if di > 0 else float("nan")
 
-    c1_F, r2_1, n1 = _slope_c("V1R")
-    c2_F, r2_2, n2 = _slope_c("V2R")
 
-    v12_residual = (g["V1R"] - g["V2R"]) - g["V12"]
-    max_abs_err_V = float(v12_residual.abs().max())
-    if max_abs_err_V > v_consistency_tol_V:
-        log.warning(
-            "step_id=%d: V12 != V1R-V2R (max abs err=%.4fV > tol=%.4fV).",
-            step_id, max_abs_err_V, v_consistency_tol_V,
-        )
+def _segments(i0: np.ndarray, i1: np.ndarray):
+    """Flattened row index of the segments [i0, i1]: (idx, seg, pos, offsets)."""
+    L = i1 - i0 + 1
+    offs = np.cumsum(L) - L
+    seg = np.repeat(np.arange(len(L)), L)
+    pos = np.arange(int(L.sum())) - np.repeat(offs, L)
+    return np.repeat(i0, L) + pos, seg, pos, offs
 
-    return dict(
-        c1_F=c1_F, c1_r2=r2_1, c1_n_points=n1,
-        c2_F=c2_F, c2_r2=r2_2, c2_n_points=n2,
-        v1r_min_V=float(g["V1R"].min()), v1r_max_V=float(g["V1R"].max()),
-        v2r_min_V=float(g["V2R"].min()), v2r_max_V=float(g["V2R"].max()),
-        v12_consistency_max_abs_err_V=max_abs_err_V,
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluation of every cycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_cycles(df: pd.DataFrame, cycles: pd.DataFrame, masses: dict) -> pd.DataFrame:
+    """
+    Section 3 values for every cycle (vectorised):
+      3.1  U_before, U1, t_U1 [ms], dU_IR = U_before - U1, ESR = dU_IR / dI
+      3.2  rows a/b of the U_min crossing, Qcd/W12/t_step interpolated at U_min
+      3.3  Q_ch = Qcd(last charge row); Q_dis = -Qcd(U_min); t_dis = t_step(U_min)
+           E_ch = W12(last charge row) - W12(first charge row)
+           E_dis = W12(last row before discharge) - W12(U_min)
+      3.4  C   = 3.6 * Q_dis / (U1 - U_min)                      [F]
+           C_E = 2 * 3.6 * E_dis / (U1^2 - U_min^2)               [F]
+           C_cell,sp = C / (2 m_mean), C_el = 2 C / m_mean        [F/g]  (same for C_E)
+           C_slope (info) = |I| / |dU/dt|, fit between 80 % and 40 % of (U1 - U_min)
+      3.5  E_sp = E_dis / (2 m_mean)                              [Wh/kg]
+           P_sp = E_dis * 3600 / t_dis / (2 m_mean)               [W/kg]
+           P_max,sp = U_max^2 / (4 ESR) / (2 m_mean) * 1000       [W/kg] (theoretical, matched load)
+           eta_C = Q_dis / Q_ch, eta_E = E_dis / E_ch
+           I_leak = (Q_ch - Q_dis) * 3600 / (t_ch + t_dis)        [mA]
+    `used` = complete cycle whose discharge reaches U_min.
+    """
+    V = df["V12"].to_numpy(dtype=float)
+    I = df["I12"].to_numpy(dtype=float)
+    Q = df["Qcd"].to_numpy(dtype=float)
+    W = df["W12"].to_numpy(dtype=float)
+    TS = df["t_step"].to_numpy(dtype=float)
+    ROWS = df["excel_row"].to_numpy()
+    m = masses["m_mean_g"]
+
+    c = cycles.copy()
+    c0, c1 = c["ch_i0"].to_numpy(), c["ch_i1"].to_numpy()
+    d0, d1 = c["dis_i0"].to_numpy(), c["dis_i1"].to_numpy()
+    umin = c["U_min"].to_numpy(dtype=float)
+    K = len(c)
+
+    # discharge rows, U_min crossing (b = first row <= U_min, a = b - 1)
+    idx, seg, pos, offs = _segments(d0, d1)
+    BIG = np.iinfo(np.int64).max
+    first = np.minimum.reduceat(np.where(V[idx] <= umin[seg], pos, BIG), offs)
+    cross = (first != BIG) & (first > 0)
+    bb = np.where(cross, d0 + np.where(cross, first, 0), d0)
+    aa = np.where(cross, bb - 1, d0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        Q_u = np.where(cross, interpolate_at(umin, V[aa], V[bb], Q[aa], Q[bb]), np.nan)
+        W_u = np.where(cross, interpolate_at(umin, V[aa], V[bb], W[aa], W[bb]), np.nan)
+        t_u = np.where(cross, interpolate_at(umin, V[aa], V[bb], TS[aa], TS[bb]), np.nan)
+    I_dis = pd.Series(I[idx]).groupby(seg).median().to_numpy()
+
+    # 3.1 IR drop / ESR
+    pre = d0 - 1
+    U_before, I_before = V[pre], I[pre]
+    U1 = V[d0]
+    dU = U_before - U1
+    dI = np.abs(I_before - I_dis) / 1000.0
+
+    # 3.3
+    Q_ch, t_ch = Q[c1], TS[c1]
+    E_ch = W[c1] - W[c0]
+    Q_dis, t_dis = -Q_u, t_u
+    E_dis = W[pre] - W_u
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ESR = dU / dI
+        C = cfg.MAH_TO_COULOMB * Q_dis / (U1 - umin)
+        C_E = 2.0 * cfg.MAH_TO_COULOMB * E_dis / (U1 ** 2 - umin ** 2)
+        P_sp = E_dis * 3600.0 / t_dis / (2.0 * m)
+        P_max = c["U_max"].to_numpy() ** 2 / (4.0 * ESR) / (2.0 * m) * 1000.0
+        eta_C = Q_dis / Q_ch
+        eta_E = E_dis / E_ch
+        I_leak = (Q_ch - Q_dis) * 3600.0 / (t_ch + t_dis)
+
+        # optional info column: slope between 80 % and 40 % of (U1 - U_min) above U_min
+        span = (U1 - umin)[seg]
+        vv, xx = V[idx], TS[idx]
+        w = ((vv <= umin[seg] + cfg.SLOPE_FIT_UPPER * span)
+             & (vv >= umin[seg] + cfg.SLOPE_FIT_LOWER * span)
+             & (pos < first[seg])).astype(float)
+        n = np.bincount(seg, w, K)
+        sx, sy = np.bincount(seg, w * xx, K), np.bincount(seg, w * vv, K)
+        sxx, sxy = np.bincount(seg, w * xx * xx, K), np.bincount(seg, w * xx * vv, K)
+        slope = (n * sxy - sx * sy) / (n * sxx - sx * sx)
+        C_slope = np.where(n >= cfg.SLOPE_FIT_MIN_POINTS,
+                           np.abs(I_dis) / 1000.0 / np.abs(slope), np.nan)
+
+    j = c["I_abs_mA"].to_numpy() / (1000.0 * m)
+    c = c.assign(
+        j_Ag=j, j_block_Ag=c["I_block_mA"].to_numpy() / (1000.0 * m),
+        U_before=U_before, I_before_mA=I_before, U1=U1, t_U1_ms=TS[d0] * 1000.0,
+        I_dis_mA=I_dis, dU_IR=dU, dI_A=dI, ESR=ESR,
+        row_a=np.where(cross, ROWS[aa], -1), row_b=np.where(cross, ROWS[bb], -1),
+        Q_ch=Q_ch, Q_dis=Q_dis, t_ch=t_ch, t_dis=t_dis, E_ch=E_ch, E_dis=E_dis,
+        C=C, C_E=C_E,
+        C_cell_sp=C / (2.0 * m), C_el=2.0 * C / m,
+        C_E_cell_sp=C_E / (2.0 * m), C_E_el=2.0 * C_E / m,
+        C_slope=C_slope,
+        E_sp=E_dis / (2.0 * m), P_sp=P_sp, P_max_sp=P_max,
+        eta_C=eta_C, eta_E=eta_E, I_leak_mA=I_leak,
+        reaches_U_min=cross,
     )
+    c["used"] = c["complete"] & c["reaches_U_min"]
+    for _, r in c[c["complete"] & ~c["reaches_U_min"]].iterrows():
+        log.warning("Cycle %d (Excel rows %d-%d): discharge incomplete -- never reaches U_min = "
+                    "%.2f V; not used", r.cycle, r.row_dis_start, r.row_dis_end, r.U_min)
+    return c
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Relaxation
+# Quality checks
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_relaxation(
-    df: pd.DataFrame,
-    steps_df: pd.DataFrame,
-    discharge_step_id: int,
-) -> dict | None:
+def nearest_standard_j(j: float) -> tuple[float, bool]:
+    """Nearest STANDARD_J value and whether j is within STANDARD_J_REL_TOL of it."""
+    std = np.asarray(cfg.STANDARD_J, dtype=float)
+    k = int(np.argmin(np.abs(std - j) / std))
+    return float(std[k]), abs(j - std[k]) <= cfg.STANDARD_J_REL_TOL * std[k]
+
+
+def cycle_checks(ev: pd.DataFrame) -> pd.Series:
     """
-    Voltage recovery during a Rest step immediately following
-    `discharge_step_id`. Returns None if no such Rest step exists.
+    Per-cycle checks (lab guide 4), as a list of (severity, text) per cycle:
+      not complete / discharge incomplete; t_U1 > T_U1_MAX_MS "IR drop read late";
+      eta_C < ETA_C_WARN (warning), < ETA_C_FLAG "low efficiency";
+      |C - C_E| / C > C_VS_CE_TOL (curve shape); dU_IR / U_max > IR_DROP_MAX_FRACTION
+      "resistance-limited"; fewer than MIN_DISCHARGE_POINTS discharge points
+      "logging too coarse" (warning).
+    Cycles that are not used get only the reason (no further checks).
     """
-    rest_rows = steps_df[steps_df["step_id"] == discharge_step_id + 1]
-    if rest_rows.empty or rest_rows.iloc[0]["kind"] != "rest":
-        return None
-
-    rest_id = int(rest_rows.iloc[0]["step_id"])
-    g = step_frame(df, rest_id)
-    v_start = float(g["V12"].iloc[0])
-    v_end   = float(g["V12"].iloc[-1])
-
-    return dict(
-        relax_step_id=rest_id,
-        relax_duration_s=float(g["t_step"].iloc[-1] - g["t_step"].iloc[0]),
-        relax_dV_V=v_end - v_start,
-        relax_v_end_V=v_end,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Normalization
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _normalizing_mass_g(basis: str, mass_total_g: float, mass_electrode_g: float) -> float:
-    """Mass used for current density / energy / power (no doubling factor)."""
-    return mass_electrode_g if basis == "single_electrode" else mass_total_g
-
-
-def _normalize_capacitance(c_cell_F: float, basis: str, mass_total_g: float, mass_electrode_g: float) -> float:
-    if basis == "single_electrode":
-        return 2.0 * c_cell_F / mass_electrode_g
-    if basis == "total_active_mass":
-        return 4.0 * c_cell_F / mass_total_g
-    return c_cell_F / mass_total_g  # "cell"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Orchestration: per-cycle table
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_gcd_cycle_table(
-    df: pd.DataFrame,
-    meta: dict,
-    ir_n_points: int = DEFAULT_IR_N_POINTS,
-    slope_window: tuple[float, float] = DEFAULT_SLOPE_WINDOW,
-    min_slope_points: int = DEFAULT_MIN_SLOPE_POINTS,
-    ocv_tol_V: float = DEFAULT_OCV_TOL_V,
-    rate_cluster_tol: float = DEFAULT_RATE_CLUSTER_TOL,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Full per-cycle GCD analysis.
-
-    Parameters
-    ----------
-    df   : raw DataFrame from gcd_loader.load_gcd_experiment()
-    meta : metadata dict from the same (REQUIRES meta["basis"],
-           meta["mass_total_g"], meta["mass_per_electrode_g"])
-
-    Returns
-    -------
-    cycle_df : tidy DataFrame, one row per complete (charge+discharge)
-               cycle > 0. See module docstring for the normalization rules.
-    steps_df : the full step-segmentation table (for QC / plotting).
-    """
-    basis            = meta["basis"]
-    mass_total_g     = meta["mass_total_g"]
-    mass_electrode_g = meta["mass_per_electrode_g"]
-    norm_mass_g      = _normalizing_mass_g(basis, mass_total_g, mass_electrode_g)
-
-    df2, steps_df = segment_steps(df)
-    steps_df = flag_ocv_start(df2, steps_df, tol_v=ocv_tol_V)
-    steps_df = assign_rate_stages(steps_df, tol=rate_cluster_tol)
-
-    tester_cycles = meta.get("tester_cycles")
-
-    rows: list[dict] = []
-    for cycle, cyc_steps in steps_df[steps_df["cycle"] > 0].groupby("cycle"):
-        charge_rows = cyc_steps[(cyc_steps["kind"] == "charge") & cyc_steps["complete"]]
-        dis_rows    = cyc_steps[(cyc_steps["kind"] == "discharge") & cyc_steps["complete"]]
-        if charge_rows.empty or dis_rows.empty:
-            log.warning("cycle=%d: no complete charge+discharge pair, skipping.", cycle)
+    out = []
+    for r in ev.itertuples(index=False):
+        f = []
+        if not r.complete:
+            out.append([(FLAG, f"{r.incomplete_reason} - not used")])
             continue
+        if not r.reaches_U_min:
+            out.append([(FLAG, "discharge incomplete - not used")])
+            continue
+        if r.t_U1_ms > cfg.T_U1_MAX_MS:
+            f.append((FLAG, f"IR drop read late (t_U1 = {r.t_U1_ms:.1f} ms > {cfg.T_U1_MAX_MS:g} ms)"))
+        if r.eta_C < cfg.ETA_C_WARN:
+            f.append((WARNING, f"eta_C = {r.eta_C:.3f} < {cfg.ETA_C_WARN}"))
+        if r.eta_C < cfg.ETA_C_FLAG:
+            f.append((FLAG, f"low efficiency (eta_C = {r.eta_C:.3f} < {cfg.ETA_C_FLAG})"))
+        dev = abs(r.C - r.C_E) / r.C
+        if dev > cfg.C_VS_CE_TOL:
+            f.append((FLAG, f"curve shape: |C - C_E| / C = {dev:.1%} > {cfg.C_VS_CE_TOL:.0%}"))
+        ir = r.dU_IR / r.U_max
+        if ir > cfg.IR_DROP_MAX_FRACTION:
+            f.append((FLAG, f"resistance-limited (dU_IR / U_max = {ir:.1%} > "
+                            f"{cfg.IR_DROP_MAX_FRACTION:.0%})"))
+        if r.n_dis < cfg.MIN_DISCHARGE_POINTS:
+            f.append((WARNING, f"logging too coarse ({r.n_dis} points in the discharge < "
+                               f"{cfg.MIN_DISCHARGE_POINTS})"))
+        out.append(f)
+    return pd.Series(out, index=ev.index, dtype=object)
 
-        charge_id = int(charge_rows.iloc[0]["step_id"])
-        dis_id    = int(dis_rows.iloc[0]["step_id"])
 
-        ir    = compute_ir_drop(df2, steps_df, dis_id, n_points=ir_n_points)
-        u_max = ir["v_prev_end_V"]
+# ─────────────────────────────────────────────────────────────────────────────
+# Rate series
+# ─────────────────────────────────────────────────────────────────────────────
 
-        slope = compute_capacitance_slope(df2, dis_id, u_max, window=slope_window, min_points=min_slope_points)
-        integ = compute_capacitance_integral(df2, dis_id, u_max, ir["ir_drop_V"])
-        energy = compute_energy_power(df2, dis_id, ir["esr_Ohm"], integ["u_eff_V"])
-        eff   = compute_efficiencies(df2, charge_id, dis_id)
-        three = compute_three_electrode(df2, dis_id, u_max, window=slope_window, min_points=min_slope_points)
-        relax = compute_relaxation(df2, steps_df, dis_id)
-
-        c_slope_F, c_integral_F = slope["c_slope_F"], integ["c_integral_F"]
-        if np.isfinite(c_slope_F) and np.isfinite(c_integral_F) and (c_slope_F + c_integral_F) != 0:
-            linearity_rel_dev = abs(c_slope_F - c_integral_F) / ((c_slope_F + c_integral_F) / 2.0)
+def rate_summary(ev: pd.DataFrame, selection: dict[int, dict]) -> tuple[pd.DataFrame, list]:
+    """
+    One row per rate block = its selected (last complete) cycle (lab guide 2/6.1),
+    with the second-to-last cycle's C, the stability value
+    |C_last - C_prev| / C_last (flag > STABLE_CYCLE_TOL; single cycle flagged),
+    the current-density check against STANDARD_J, and the retention
+    C / C(lowest j) [%]. Returns (table, series_flags) where series_flags
+    holds the ESR-constancy check of the whole rate series.
+    """
+    rows = []
+    rate_blocks = ev[ev["test_type"] == RATE].groupby("block")
+    by_cycle = ev.set_index("cycle")
+    for b, g in rate_blocks:
+        sel = selection.get(int(b))
+        first = g.iloc[0]
+        if sel is None:
+            rows.append({"block": int(b), "occurrence": int(first.occurrence),
+                         "j_Ag": first.j_block_Ag, "I_mA": first.I_block_mA,
+                         "n_cycles": len(g), "n_complete": 0, "selected_cycle": np.nan,
+                         "block_flags": [(FLAG, "no complete cycle - block not evaluated")]})
+            log.warning("Rate block %d: no complete cycle, not evaluated", b)
+            continue
+        r = by_cycle.loc[sel["last"]]
+        flags = []
+        std, ok = nearest_standard_j(r.j_block_Ag)
+        if not ok:
+            flags.append((FLAG, f"non-standard current density, check program and current range "
+                                f"(j = {r.j_block_Ag:.3g} A/g, nearest standard {std:g} A/g)"))
+        if sel["prev"] is None:
+            c_prev, stab = np.nan, np.nan
+            flags.append((FLAG, "single complete cycle - stability not checked"))
         else:
-            linearity_rel_dev = np.nan
-
-        over_values = sorted(
-            v for v in df2.loc[df2["step_id"].isin(cyc_steps["step_id"]), "over"].unique()
-            if v not in ("--", "nan")
-        )
-
-        row = dict(
-            cell_tag=meta.get("cell_tag"), exp_name=meta.get("exp_name"),
-            cycle=int(cycle),
-            rate_group=int(dis_rows.iloc[0]["rate_group"]),
-            i_nominal_mA=float(dis_rows.iloc[0]["i_nominal_mA"]),
-            i_charge_mA=float(charge_rows.iloc[0]["i_abs_mean_mA"]),
-            i_discharge_mA=float(dis_rows.iloc[0]["i_abs_mean_mA"]),
-            basis=basis,
-            ocv_start=bool(charge_rows.iloc[0]["ocv_start"]),
-            over_flags=",".join(over_values) if over_values else "",
-            u_max_V=u_max,
-            ir_drop_V=ir["ir_drop_V"], ir_fit_r2=ir["ir_fit_r2"], ir_n_points=ir["ir_n_points"],
-            esr_Ohm=ir["esr_Ohm"], esr_variant=ir["esr_variant"],
-            c_cell_slope_F=c_slope_F, slope_r2=slope["slope_r2"], slope_n_points=slope["n_points_used"],
-            c_cell_integral_F=c_integral_F, u_eff_V=integ["u_eff_V"],
-            capacitance_linearity_rel_dev=linearity_rel_dev,
-            C_spec_slope=_normalize_capacitance(c_slope_F, basis, mass_total_g, mass_electrode_g),
-            C_spec_integral=_normalize_capacitance(c_integral_F, basis, mass_total_g, mass_electrode_g),
-            current_density_Ag=(dis_rows.iloc[0]["i_abs_mean_mA"] / 1000.0) / norm_mass_g,
-            E_discharge_Whkg=energy["e_mWh"] / norm_mass_g,
-            P_mean_Wkg=energy["p_mean_mW"] / norm_mass_g,
-            P_max_Wkg=energy["p_max_mW"] / norm_mass_g,
-            t_charge_s=eff["t_charge_s"], t_discharge_s=eff["t_discharge_s"],
-            coulomb_eff_time=eff["coulomb_eff_time"], coulomb_eff_charge=eff["coulomb_eff_charge"],
-            energy_eff=eff["energy_eff"],
-            q_charge_mAh=eff["q_charge_mAh"], q_discharge_mAh=eff["q_discharge_mAh"],
-        )
-
-        if three is not None:
-            row.update({
-                "C1_spec": _normalize_capacitance(three["c1_F"], basis, mass_total_g, mass_electrode_g),
-                "C2_spec": _normalize_capacitance(three["c2_F"], basis, mass_total_g, mass_electrode_g),
-                "c1_r2": three["c1_r2"], "c2_r2": three["c2_r2"],
-                "v1r_min_V": three["v1r_min_V"], "v1r_max_V": three["v1r_max_V"],
-                "v2r_min_V": three["v2r_min_V"], "v2r_max_V": three["v2r_max_V"],
-                "v12_consistency_max_abs_err_V": three["v12_consistency_max_abs_err_V"],
-            })
-
-        if relax is not None:
-            row.update({
-                "relax_duration_s": relax["relax_duration_s"],
-                "relax_dV_V": relax["relax_dV_V"],
-                "relax_v_end_V": relax["relax_v_end_V"],
-            })
-
-        if tester_cycles is not None:
-            match = tester_cycles[tester_cycles["cycle"] == cycle]
-            if not match.empty:
-                for col in match.columns:
-                    if col != "cycle":
-                        row[col] = match.iloc[0][col]
-
-        rows.append(row)
-
-    cycle_df = pd.DataFrame(rows)
-    if not cycle_df.empty:
-        cycle_df = cycle_df.sort_values("cycle").reset_index(drop=True)
-    return cycle_df, steps_df
+            c_prev = by_cycle.loc[sel["prev"], "C"]
+            stab = abs(r.C - c_prev) / r.C
+            if stab > cfg.STABLE_CYCLE_TOL:
+                flags.append((FLAG, f"not stable: C changed {stab:.2%} vs previous cycle "
+                                    f"(> {cfg.STABLE_CYCLE_TOL:.0%})"))
+        rows.append({**r.to_dict(), "cycle": sel["last"], "selected_cycle": sel["last"],
+                     "prev_cycle": sel["prev"], "C_prev": c_prev, "stability": stab,
+                     "n_cycles": len(g), "n_complete": sel["n_complete"],
+                     "j_standard_Ag": std, "block_flags": flags})
+    rate = pd.DataFrame(rows)
+    series_flags = []
+    if rate.empty or "C" not in rate:
+        return rate, series_flags
+    ok = rate["C"].notna()
+    if ok.any():
+        ref = rate[ok].sort_values(["j_block_Ag", "block"]).iloc[0]
+        rate["retention_pct"] = 100.0 * rate["C"] / ref["C"]
+        rate["retention_ref_block"] = int(ref["block"])
+        esr = rate.loc[ok, "ESR"]
+        spread = (esr.max() - esr.min()) / esr.min()
+        rate.attrs["esr_spread"] = spread
+        if spread > cfg.ESR_SPREAD_TOL:
+            series_flags.append((FLAG, f"ESR not constant in the rate series: (max - min) / min = "
+                                       f"{spread:.1%} > {cfg.ESR_SPREAD_TOL:.0%}"))
+        else:
+            series_flags.append((INFO, f"ESR spread in the rate series {spread:.1%} "
+                                       f"(<= {cfg.ESR_SPREAD_TOL:.0%})"))
+    return rate, series_flags
 
 
-def compute_gcd_rate_aggregate(
-    cycle_df: pd.DataFrame,
-    exclude_first_cycle: bool = True,
-) -> pd.DataFrame:
+def compare_with_cv(sample_dir: Path, rate: pd.DataFrame) -> dict | None:
     """
-    Mean +/- std per rate stage, over complete, non-OCV-flagged cycles.
-
-    Parameters
-    ----------
-    cycle_df            : output of compute_gcd_cycle_table()
-    exclude_first_cycle : if True, additionally skip the first cycle of
-                          each rate stage (formation cycle)
+    Comparison with CV (lab guide 4): C_el of the rate block with the lowest
+    j vs the CV C_el at the lowest scan rate in the matching window -- the
+    one-sided window 0->U_max, or +-U_max if there is no one-sided window --
+    read from <sample_dir>/cv/results.xlsx (sheet Summary).
+    Deviation = (C_el,GCD - C_el,CV) / C_el,CV; > CV_COMPARE_TOL -> flag.
+    Returns None if there are no CV results or no matching window.
     """
-    if cycle_df.empty:
-        return cycle_df.copy()
-
-    df = cycle_df[~cycle_df["ocv_start"]].copy()
-
-    if exclude_first_cycle:
-        first_cycle = df.groupby("rate_group")["cycle"].transform("min")
-        df = df[df["cycle"] > first_cycle]
-
-    numeric_cols = [
-        "i_nominal_mA", "current_density_Ag",
-        "C_spec_slope", "C_spec_integral", "capacitance_linearity_rel_dev",
-        "esr_Ohm", "ir_drop_V",
-        "E_discharge_Whkg", "P_mean_Wkg", "P_max_Wkg",
-        "coulomb_eff_time", "coulomb_eff_charge", "energy_eff",
-    ]
-    numeric_cols = [c for c in numeric_cols if c in df.columns]
-
-    agg = df.groupby("rate_group")[numeric_cols].agg(["mean", "std"])
-    agg.columns = [f"{col}_{stat}" for col, stat in agg.columns]
-    agg["n_cycles"] = df.groupby("rate_group").size()
-    agg = agg.reset_index().sort_values("rate_group").reset_index(drop=True)
-
-    for col in agg.columns:
-        if col.endswith("_std"):
-            agg[col] = agg[col].fillna(0.0)
-
-    return agg
-
-
-def compute_capacity_retention(rate_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Capacity retention (%) per rate stage, relative to the LOWEST-current
-    rate stage (not necessarily rate_group==0, though assign_rate_stages()
-    numbers groups ascending by current so it normally is):
-
-        retention_pct(stage) = 100 * C_spec_mean(stage) / C_spec_mean(lowest stage)
-
-    computed separately for the slope and integral methods.
-
-    Parameters
-    ----------
-    rate_df : output of compute_gcd_rate_aggregate()
-
-    Returns
-    -------
-    DataFrame: rate_group, current_density_Ag, i_nominal_mA,
-               retention_slope_pct, retention_integral_pct
-    """
-    if rate_df.empty:
-        return rate_df.copy()
-
-    ref_idx = rate_df["current_density_Ag_mean"].idxmin()
-    ref_slope = rate_df.loc[ref_idx, "C_spec_slope_mean"]
-    ref_integral = rate_df.loc[ref_idx, "C_spec_integral_mean"]
-
-    out = rate_df[[
-        "rate_group", "current_density_Ag_mean", "i_nominal_mA_mean",
-        "C_spec_slope_mean", "C_spec_integral_mean",
-    ]].rename(columns={
-        "current_density_Ag_mean": "current_density_Ag",
-        "i_nominal_mA_mean": "i_nominal_mA",
-    }).copy()
-
-    out["retention_slope_pct"] = 100.0 * out["C_spec_slope_mean"] / ref_slope
-    out["retention_integral_pct"] = 100.0 * out["C_spec_integral_mean"] / ref_integral
-
-    return out.sort_values("rate_group").reset_index(drop=True)
+    cv_file = sample_dir / "cv" / "results.xlsx"
+    if rate.empty or "C_el" not in rate or not cv_file.exists():
+        return None
+    ok = rate[rate["C_el"].notna()]
+    if ok.empty:
+        return None
+    g = ok.sort_values(["j_block_Ag", "block"]).iloc[0]
+    try:
+        cv = pd.read_excel(cv_file, sheet_name="Summary")
+    except (OSError, ValueError) as exc:
+        log.warning("CV results %s not readable: %s", cv_file, exc)
+        return None
+    u = round(float(g["U_max_block"]), 2)
+    match = cv[(cv["U_max_V"] - u).abs() <= 0.005]
+    one = match[match["window_type"] == "one-sided"]
+    sel, wtxt = (one, "0->U_max") if len(one) else (match[match["window_type"] == "symmetric"],
+                                                       "+-U_max")
+    if sel.empty:
+        log.info("CV results found but no window with U_max = %.2f V for the comparison", u)
+        return None
+    cvrow = sel[sel["nu_nom_mVs"] == sel["nu_nom_mVs"].min()].iloc[-1]
+    res = dict(cv_file=str(cv_file), cv_window=f"{wtxt} = {u:g} V", cv_nu_mVs=cvrow["nu_nom_mVs"],
+               cv_C_el=cvrow["C_el_Fg"], gcd_j=g["j_block_Ag"], gcd_block=int(g["block"]),
+               gcd_C_el=g["C_el"])
+    note = f"CV window {wtxt}, GCD window 0->U_max"
+    if not np.isfinite(res["cv_C_el"]):
+        res.update(deviation=np.nan, severity=INFO,
+                   text=f"CV C_el at {wtxt}, {res['cv_nu_mVs']:g} mV/s not evaluable; {note}")
+        return res
+    dev = (res["gcd_C_el"] - res["cv_C_el"]) / res["cv_C_el"]
+    res["deviation"] = dev
+    res["severity"] = FLAG if abs(dev) > cfg.CV_COMPARE_TOL else INFO
+    res["text"] = (f"GCD C_el at {res['gcd_j']:.3g} A/g = {res['gcd_C_el']:.1f} F/g vs CV "
+                   f"{res['cv_C_el']:.1f} F/g ({wtxt}, {res['cv_nu_mVs']:g} mV/s): {dev:+.1%}"
+                   f"{' > ' + format(cfg.CV_COMPARE_TOL, '.0%') if abs(dev) > cfg.CV_COMPARE_TOL else ''}"
+                   f" ({note})")
+    return res
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# QC report
+# Long-term tests
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_qc_report(
-    cycle_df: pd.DataFrame,
-    steps_df: pd.DataFrame,
-    r2_threshold: float = DEFAULT_R2_WARN_THRESHOLD,
-    linearity_threshold: float = DEFAULT_LINEARITY_WARN_THRESHOLD,
-    coulomb_eff_range: tuple[float, float] = DEFAULT_COULOMB_EFF_PLAUSIBLE,
-) -> str:
-    """Plain-text QC summary: dropped steps, over-flags, fit quality, ..."""
-    lines: list[str] = ["GCD QC report", "=" * 60]
+def end_of_life(x: np.ndarray, retention: np.ndarray, esr_rel: np.ndarray, start: int) -> dict:
+    """
+    End of life (lab guide 5.1): the first point after the reference at which
+    retention < EOL_RETENTION or ESR/ESR0 > EOL_ESR; the x value (cycle number
+    or hold time) is interpolated linearly between that point and the one
+    before it. Returns dict(eol_x, criterion, index) or criterion "not reached".
+    """
+    bad_r = retention < cfg.EOL_RETENTION
+    bad_e = esr_rel > cfg.EOL_ESR
+    cand = np.flatnonzero((bad_r | bad_e) & (np.arange(len(x)) > start))
+    if len(cand) == 0:
+        return dict(eol_x=np.nan, criterion="not reached", index=-1)
+    i = int(cand[0])
+    hits = []
+    for name, y, thr, bad in (("retention < 80 %", retention, cfg.EOL_RETENTION, bad_r),
+                              ("ESR/ESR0 > 2", esr_rel, cfg.EOL_ESR, bad_e)):
+        if bad[i]:
+            if i > 0 and y[i] != y[i - 1]:
+                xe = x[i - 1] + (thr - y[i - 1]) / (y[i] - y[i - 1]) * (x[i] - x[i - 1])
+            else:
+                xe = x[i]
+            hits.append((xe, name))
+    xe, name = min(hits)
+    if cfg.EOL_RETENTION != 0.8 or cfg.EOL_ESR != 2.0:
+        name = name.replace("80 %", f"{cfg.EOL_RETENTION:.0%}").replace("> 2", f"> {cfg.EOL_ESR:g}")
+    return dict(eol_x=float(xe), criterion=name, index=i)
 
-    dropped = steps_df[~steps_df["complete"]]
-    lines.append(f"\nDropped incomplete trailing steps: {len(dropped)}")
-    for _, r in dropped.iterrows():
-        lines.append(f"  cycle={r['cycle']} step={r['step']} ({r['type']}, c/d={r['c_d']}) "
-                      f"-- {r['n_points']} points, {r['duration_s']:.3f}s")
 
-    ocv = cycle_df[cycle_df["ocv_start"]]
-    lines.append(f"\nCycles flagged ocv_start (excluded from aggregates): {len(ocv)}")
-    for _, r in ocv.iterrows():
-        lines.append(f"  cycle={r['cycle']}")
+def longterm_cycling(ev: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Cycling test (lab guide 5.1), per cycling block: every used cycle;
+    reference C0/ESR0 = the first cycle whose C differs from the next by
+    less than STABILISED_TOL (cell stabilised), else cycle 2 of the block;
+    retention = C/C0 [%], ESR increase = ESR/ESR0; end of life vs cycle
+    number in the block. Returns (table, one summary dict per block).
+    """
+    tables, summaries = [], []
+    for b, g in ev[(ev["test_type"] == CYCLING) & ev["used"]].groupby("block"):
+        g = g.sort_values("cycle_in_block")
+        C, esr = g["C"].to_numpy(), g["ESR"].to_numpy()
+        x = g["cycle_in_block"].to_numpy(dtype=float)
+        rel = np.abs(np.diff(C)) / C[:-1]
+        stab = np.flatnonzero(rel < cfg.STABILISED_TOL)
+        if len(stab):
+            ref = int(stab[0])
+            how = "first stabilised cycle (|C - C_next| / C < 1 %)"
+        else:
+            ref = int(np.flatnonzero(x == 2)[0]) if (x == 2).any() else 0
+            how = "fallback: cycle 2 of the block"
+        retention = C / C[ref]
+        esr_rel = esr / esr[ref]
+        eol = end_of_life(x, retention, esr_rel, ref)
+        log.info("Cycling block %d: reference cycle %d of the block (%s); end of life: %s",
+                 b, int(x[ref]), how,
+                 "not reached" if eol["criterion"] == "not reached"
+                 else f"cycle {eol['eol_x']:.1f} ({eol['criterion']})")
+        t = g[["block", "cycle", "cycle_in_block", "instr_cycle", "j_Ag", "C", "C_el", "ESR",
+               "eta_C", "eta_E"]].copy()
+        t["retention_pct"] = 100.0 * retention
+        t["ESR_rel"] = esr_rel
+        t["reference_cycle_in_block"] = int(x[ref])
+        t["eol_cycle"] = eol["eol_x"]
+        t["eol_criterion"] = eol["criterion"]
+        tables.append(t)
+        summaries.append(dict(block=int(b), j=float(g["j_block_Ag"].iloc[0]), n_used=len(g),
+                              n_cycles=int(g["n_cycles_block"].iloc[0]),
+                              reference=int(x[ref]), reference_how=how, C0=float(C[ref]),
+                              ESR0=float(esr[ref]), **{f"eol_{k}": v for k, v in eol.items()}))
+    return (pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()), summaries
 
-    flagged = cycle_df[cycle_df["over_flags"] != ""]
-    lines.append(f"\nCycles with 'over' flags: {len(flagged)}")
-    for _, r in flagged.iterrows():
-        lines.append(f"  cycle={r['cycle']}: {r['over_flags']}")
 
-    low_r2 = cycle_df[cycle_df["slope_r2"] < r2_threshold]
-    lines.append(f"\nCycles with slope-fit R^2 < {r2_threshold}: {len(low_r2)}")
-    for _, r in low_r2.iterrows():
-        lines.append(f"  cycle={r['cycle']}: R^2={r['slope_r2']:.4f} (n={r['slope_n_points']})")
+def holds_table(df: pd.DataFrame, steps: pd.DataFrame, masses: dict) -> pd.DataFrame:
+    """
+    Per voltage hold (lab guide 5.2): rows, hold voltage (median V12),
+    duration [h], cumulative hold time [h], and the mean leakage current over
+    the last HOLD_LEAK_WINDOW_S of the hold [mA and mA/g per m_mean].
+    """
+    h = steps[steps["kind"] == HOLD]
+    if h.empty:
+        return pd.DataFrame()
+    t = df["t"].to_numpy(dtype=float)
+    I = df["I12"].to_numpy(dtype=float)
+    leak = []
+    for s in h.itertuples():
+        sl = slice(s.i0, s.i1 + 1)
+        last = t[sl] >= t[s.i1] - cfg.HOLD_LEAK_WINDOW_S
+        leak.append(float(np.mean(I[sl][last])))
+    out = pd.DataFrame({
+        "hold": np.arange(1, len(h) + 1),
+        "row_start": h["row_start"].to_numpy(), "row_end": h["row_end"].to_numpy(),
+        "type": h["type"].to_numpy(), "con": h["con"].to_numpy(),
+        "V_hold": h["V_median"].to_numpy(),
+        "duration_h": h["duration_s"].to_numpy() / 3600.0,
+        "leak_mA": leak,
+    })
+    out["leak_mA_per_g"] = out["leak_mA"] / masses["m_mean_g"]
+    out["cumulative_h"] = out["duration_h"].cumsum()
+    return out
 
-    low_points = cycle_df[cycle_df["slope_n_points"] < DEFAULT_MIN_SLOPE_POINTS]
-    lines.append(f"\nCycles with < {DEFAULT_MIN_SLOPE_POINTS} points in the slope-fit window: {len(low_points)}")
-    for _, r in low_points.iterrows():
-        lines.append(f"  cycle={r['cycle']}: {r['slope_n_points']} points")
 
-    bad_linearity = cycle_df[cycle_df["capacitance_linearity_rel_dev"] > linearity_threshold]
-    lines.append(f"\nCycles with slope-vs-integral deviation > {linearity_threshold*100:.0f}%: {len(bad_linearity)}")
-    for _, r in bad_linearity.iterrows():
-        lines.append(f"  cycle={r['cycle']}: {r['capacitance_linearity_rel_dev']*100:.1f}%")
-
-    lo, hi = coulomb_eff_range
-    non_ocv = cycle_df[~cycle_df["ocv_start"]]
-    implausible = non_ocv[
-        (non_ocv["coulomb_eff_charge"] < lo) | (non_ocv["coulomb_eff_charge"] > hi)
-    ]
-    lines.append(f"\nCycles with Coulomb efficiency outside [{lo}, {hi}] (excl. ocv_start): {len(implausible)}")
-    for _, r in implausible.iterrows():
-        lines.append(f"  cycle={r['cycle']}: {r['coulomb_eff_charge']:.4f}")
-
-    return "\n".join(lines) + "\n"
+def longterm_floating(ev: pd.DataFrame, holds: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Floating test (lab guide 5.2): each check-up = the CC cycles between two
+    holds; for every current density in a check-up its last complete cycle.
+    x = cumulative hold time [h] at the end of the preceding hold (0 for the
+    check-up before the first hold). Reference = first check-up (per j);
+    retention, ESR increase and end of life vs hold time as in 5.1.
+    """
+    fl = ev[(ev["test_type"] == FLOATING) & ev["used"]].copy()
+    if fl.empty:
+        return pd.DataFrame(), []
+    cum = np.r_[0.0, holds["cumulative_h"].to_numpy()] if not holds.empty else np.array([0.0])
+    fl["j_group"] = cluster_values(fl["j_block_Ag"].to_numpy())
+    last = fl.sort_values("cycle").groupby(["checkup", "j_group"]).tail(1)
+    tables, summaries = [], []
+    for jg, g in last.groupby("j_group"):
+        g = g.sort_values("checkup")
+        x = cum[np.minimum(g["checkup"].to_numpy(), len(cum) - 1)]
+        C, esr = g["C"].to_numpy(), g["ESR"].to_numpy()
+        retention, esr_rel = C / C[0], esr / esr[0]
+        eol = end_of_life(x, retention, esr_rel, 0)
+        j = float(g["j_block_Ag"].median())
+        log.info("Floating, j = %.3g A/g: %d check-ups; end of life: %s", j, len(g),
+                 "not reached" if eol["criterion"] == "not reached"
+                 else f"{eol['eol_x']:.1f} h ({eol['criterion']})")
+        t = g[["checkup", "block", "cycle", "instr_cycle", "j_block_Ag", "C", "C_el", "ESR",
+               "eta_C", "eta_E"]].copy()
+        t["hold_time_h"] = x
+        t["retention_pct"] = 100.0 * retention
+        t["ESR_rel"] = esr_rel
+        t["eol_hold_time_h"] = eol["eol_x"]
+        t["eol_criterion"] = eol["criterion"]
+        tables.append(t)
+        summaries.append(dict(j=j, n_checkups=len(g), C0=float(C[0]), ESR0=float(esr[0]),
+                              **{f"eol_{k}": v for k, v in eol.items()}))
+    return pd.concat(tables, ignore_index=True), summaries

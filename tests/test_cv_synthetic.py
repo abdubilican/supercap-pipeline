@@ -17,7 +17,7 @@ import pytest
 
 from cv_synth import one_sided_program, symmetric_program, write_masses, write_txt, write_xlsx
 from supercap_pipeline.cv_analysis import evaluate_blocks
-from supercap_pipeline.cv_io import read_export
+from supercap_pipeline.export_io import read_export
 from supercap_pipeline.cv_segmentation import (
     detect_blocks, drop_transition_sweeps, find_sweeps, pair_cycles,
 )

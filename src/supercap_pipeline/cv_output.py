@@ -14,35 +14,19 @@ by hand from V_a, V_b, Qcd_a, Qcd_b.
 from __future__ import annotations
 
 import datetime as _dt
-import subprocess
-from importlib import metadata
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from . import cv_config as cfg
+from .results_io import pipeline_version, write_csv, write_workbook
 
 SEGMENTS = {  # (discharge, charge) segment names per polarity
     ("symmetric", "+"): ("+U->0 (down sweep)", "0->+U (up sweep)"),
     ("symmetric", "-"): ("-U->0 (up sweep)", "0->-U (down sweep)"),
     ("one-sided", "+"): ("U->0 (down sweep)", "0->U (up sweep)"),
 }
-
-
-def _plain_number(x: float) -> str:
-    """Positional notation (never 1e-05) with a decimal point, e.g. -0.00001."""
-    return np.format_float_positional(x, precision=10, unique=True, trim="-")
-
-
-def write_csv(df: pd.DataFrame, path: Path) -> Path:
-    """
-    CSV with ';' as separator, decimal point, no exponent notation, UTF-8
-    with BOM (so '±' is shown correctly in Excel). Read back with
-    pd.read_csv(sep=';').
-    """
-    df.to_csv(path, sep=";", index=False, encoding="utf-8-sig", float_format=_plain_number)
-    return path
 
 
 def _block_cols(b: dict, sample_id: str, source: str) -> dict:
@@ -124,25 +108,6 @@ def summary_table(blocks: list[dict], sample_id: str, source: str) -> pd.DataFra
     return pd.DataFrame(rows)
 
 
-def pipeline_version() -> str:
-    """Package version plus the git commit of the source tree (if available)."""
-    try:
-        ver = metadata.version("supercap-pipeline")
-    except metadata.PackageNotFoundError:
-        ver = "unknown"
-    try:
-        here = Path(__file__).resolve().parent
-        commit = subprocess.run(["git", "-C", str(here), "rev-parse", "--short", "HEAD"],
-                                capture_output=True, text=True, timeout=5).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(here), "status", "--porcelain", "--", "."],
-                               capture_output=True, text=True, timeout=5).stdout.strip()
-        if commit:
-            ver += f" ({commit}{'+dirty' if dirty else ''})"
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return ver
-
-
 def meta_table(masses: dict, sample_id: str, source: str, n_dropped: int) -> pd.DataFrame:
     """Sheet "Meta": masses, provenance and every tolerance used."""
     items = [
@@ -168,14 +133,10 @@ def meta_table(masses: dict, sample_id: str, source: str, n_dropped: int) -> pd.
 def write_results(out_dir: Path, results: pd.DataFrame, summary: pd.DataFrame,
                   meta: pd.DataFrame, warnings: list[str]) -> list[Path]:
     """Write results.xlsx (Results, Summary, Meta, Warnings) and results.csv."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    xlsx = out_dir / "results.xlsx"
-    csv = out_dir / "results.csv"
-    with pd.ExcelWriter(xlsx) as xw:
-        results.to_excel(xw, sheet_name="Results", index=False)
-        summary.to_excel(xw, sheet_name="Summary", index=False)
-        meta.to_excel(xw, sheet_name="Meta", index=False)
-        pd.DataFrame({"warning": warnings or ["(none)"]}).to_excel(
-            xw, sheet_name="Warnings", index=False)
-    write_csv(results, csv)
-    return [xlsx, csv]
+    xlsx = write_workbook(out_dir / "results.xlsx", {
+        "Results": results,
+        "Summary": summary,
+        "Meta": meta,
+        "Warnings": pd.DataFrame({"warning": warnings or ["(none)"]}),
+    })
+    return [xlsx, write_csv(results, out_dir / "results.csv")]

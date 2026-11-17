@@ -14,7 +14,7 @@ from cv_synth import write_masses
 from supercap_pipeline.cv_analysis import (
     capacitance, charges_symmetric, evaluability, interpolate_zero_crossing,
 )
-from supercap_pipeline.cv_io import read_masses
+from supercap_pipeline.export_io import read_masses
 from supercap_pipeline.cv_segmentation import classify_window, round_sig
 
 

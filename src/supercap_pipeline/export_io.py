@@ -1,12 +1,14 @@
 """
-cv_io.py
---------
-Input side of the CV evaluation (lab guide section 1).
+export_io.py
+------------
+Input side shared by the CV and the GCD evaluation (lab guides, section 1).
 
 read_export()  reads a PAT-Tester (EL-Cell) export -- the .xlsx with sheet
                "Output", or the tab-separated Output.txt of the same layout --
                and keeps the spreadsheet row number of every data row in the
                column `excel_row`, so every result can be checked by hand.
+               Which columns are read is given by a ColumnSet (CV_COLUMNS,
+               GCD_COLUMNS, TYPE_COLUMNS).
 read_masses()  reads m1 and m2 from the Input-Variables.txt of the measurement.
 
 Both files are only read, never written.
@@ -18,83 +20,117 @@ import importlib.util
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from . import cv_config as cfg
+log = logging.getLogger("supercap_pipeline.io")
 
-log = logging.getLogger("supercap_pipeline.cv").getChild("io")
+# ── Export layout and mass file (shared; listed in the Meta sheets) ──────────
+OUTPUT_SHEET = "Output"            # sheet holding the raw data in the xlsx export
+EXCEL_FIRST_DATA_ROW = 3           # row 1 = names, row 2 = units -> data from row 3
+MASS_FILE_PATTERN = "*Input-Variables*.txt"
+MASS_MIN_G = 1e-4                  # plausibility range of one electrode mass [g];
+MASS_MAX_G = 1.0                   # outside it the unit is probably not g -> error
 
-# Columns the CV evaluation reads (lab guide 1.1). |Qstep|, |Qcd|, Qc and Qd
-# are deliberately absent: they lose the sign or are not split at 0 V.
-NUMERIC_COLUMNS = ("t", "t_step", "cycle", "step", "V12", "I12", "Qcd")
-STRING_COLUMNS = ("type", "c/d")
-REQUIRED_COLUMNS = NUMERIC_COLUMNS + STRING_COLUMNS
+
+@dataclass(frozen=True)
+class ColumnSet:
+    """Columns to read: numeric, string, and the subset that may be absent."""
+    numeric: tuple[str, ...]
+    strings: tuple[str, ...]
+    optional: tuple[str, ...] = ()
+
+    @property
+    def all(self) -> tuple[str, ...]:
+        return self.numeric + self.strings
+
+
+# CV (lab guide CV 1.1). |Qstep|, |Qcd|, Qc and Qd are deliberately absent:
+# they lose the sign or are not split at 0 V.
+CV_COLUMNS = ColumnSet(("t", "t_step", "cycle", "step", "V12", "I12", "Qcd"), ("type", "c/d"))
+# GCD (lab guide GCD 1.1): charge from Qcd, energy from W12; never |Qstep|,
+# |Qcd|, Qc, Qd or P. `con` is only used to cross-check voltage holds.
+GCD_COLUMNS = ColumnSet(("t", "t_step", "cycle", "step", "V12", "I12", "Qcd", "W12"),
+                        ("type", "c/d", "con"), optional=("con",))
+# Only the step type: used to decide CV vs GCD per file.
+TYPE_COLUMNS = ColumnSet((), ("type",))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Measurement export
 # ─────────────────────────────────────────────────────────────────────────────
 
-def read_export(path: str | Path) -> pd.DataFrame:
+def read_export(path: str | Path, columns: ColumnSet = CV_COLUMNS) -> pd.DataFrame:
     """
-    Read one PAT-Tester export into a DataFrame with the columns
-    t, t_step, cycle, step, type, c/d, V12, I12, Qcd and excel_row.
+    Read one PAT-Tester export into a DataFrame with the columns of
+    `columns` (default: the CV set t, t_step, cycle, step, type, c/d, V12,
+    I12, Qcd) plus excel_row.
 
     Layout (both .xlsx sheet "Output" and Output.txt): row 1 = column names,
     row 2 = units, data from row 3, so  excel_row = pandas index + 3  of the
     unfiltered table. For Output.txt the "Excel row" is the line number.
     Column names and string cells are stripped of the trailing spaces the
-    tester writes ("VS ", "c "); columns are accessed by name only.
+    tester writes ("VS ", "CC ", "c "); columns are accessed by name only.
     Rows without t or V12 are dropped afterwards; excel_row is kept.
+    Optional columns that are absent are filled with "" (strings) or NaN.
     """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Export file not found: {path}")
 
+    wanted = set(columns.all)
     if path.suffix.lower() in (".xlsx", ".xlsm"):
-        raw = _read_xlsx(path)
+        raw = _read_xlsx(path, wanted)
     else:
-        raw = _read_txt(path)
+        raw = _read_txt(path, wanted)
 
-    missing = [c for c in REQUIRED_COLUMNS if c not in raw.columns]
+    missing = [c for c in columns.all if c not in raw.columns and c not in columns.optional]
     if missing:
         raise ValueError(f"{path.name}: required column(s) missing: {missing}")
+    for c in columns.optional:
+        if c not in raw.columns:
+            raw[c] = "" if c in columns.strings else np.nan
+            log.info("%s: optional column '%s' not present", path.name, c)
 
-    df = raw[list(REQUIRED_COLUMNS)].copy()
-    df.insert(0, "excel_row", np.arange(len(df), dtype=np.int64) + cfg.EXCEL_FIRST_DATA_ROW)
+    df = raw[list(columns.all)].copy()
+    df.insert(0, "excel_row", np.arange(len(df), dtype=np.int64) + EXCEL_FIRST_DATA_ROW)
 
-    for col in STRING_COLUMNS:
+    for col in columns.strings:
         df[col] = df[col].astype("string").str.strip().fillna("")
-    for col in NUMERIC_COLUMNS:
+    for col in columns.numeric:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     n_raw = len(df)
-    df = df.dropna(subset=["t", "V12"]).reset_index(drop=True)
-    df["cycle"] = df["cycle"].fillna(-1).astype(int)
-    df["step"] = df["step"].fillna(-1).astype(int)
+    key = [c for c in ("t", "V12") if c in df.columns]
+    if key:
+        df = df.dropna(subset=key).reset_index(drop=True)
+    for c in ("cycle", "step"):
+        if c in df.columns:
+            df[c] = df[c].fillna(-1).astype(int)
     log.info("Read %s: %d data rows (%d without t/V12 ignored)",
              path.name, len(df), n_raw - len(df))
     return df
 
 
-def _wanted(name) -> bool:
-    return str(name).strip() in REQUIRED_COLUMNS
+def step_types(path: str | Path) -> set[str]:
+    """The set of values in the `type` column, e.g. {"Rest", "VS"} or {"Rest", "CC"}."""
+    return set(read_export(path, TYPE_COLUMNS)["type"]) - {""}
 
 
-def _read_txt(path: Path) -> pd.DataFrame:
+def _read_txt(path: Path, wanted: set[str]) -> pd.DataFrame:
     """Tab-separated Output.txt; blank lines kept so line numbers stay exact."""
     df = pd.read_csv(
-        path, sep="\t", header=0, skiprows=[1], usecols=_wanted,
+        path, sep="\t", header=0, skiprows=[1], usecols=lambda c: str(c).strip() in wanted,
         skip_blank_lines=False, dtype=str, encoding_errors="replace",
     )
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def _read_xlsx(path: Path) -> pd.DataFrame:
+def _read_xlsx(path: Path, wanted: set[str]) -> pd.DataFrame:
     """
     Sheet "Output" of the xlsx export, read in one pass by calamine (fast,
     Rust) or, if python-calamine is not installed, by openpyxl in read-only
@@ -104,49 +140,61 @@ def _read_xlsx(path: Path) -> pd.DataFrame:
         from python_calamine import CalamineWorkbook
 
         wb = CalamineWorkbook.from_path(str(path))
-        if cfg.OUTPUT_SHEET not in wb.sheet_names:
-            raise ValueError(f"{path.name}: no sheet named '{cfg.OUTPUT_SHEET}' "
+        if OUTPUT_SHEET not in wb.sheet_names:
+            raise ValueError(f"{path.name}: no sheet named '{OUTPUT_SHEET}' "
                              f"(sheets: {wb.sheet_names})")
-        rows = wb.get_sheet_by_name(cfg.OUTPUT_SHEET).to_python(skip_empty_area=False)
+        rows = wb.get_sheet_by_name(OUTPUT_SHEET).to_python(skip_empty_area=False)
         engine = "calamine"
     else:
         import openpyxl
 
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         try:
-            if cfg.OUTPUT_SHEET not in wb.sheetnames:
-                raise ValueError(f"{path.name}: no sheet named '{cfg.OUTPUT_SHEET}' "
+            if OUTPUT_SHEET not in wb.sheetnames:
+                raise ValueError(f"{path.name}: no sheet named '{OUTPUT_SHEET}' "
                                  f"(sheets: {wb.sheetnames})")
-            rows = list(wb[cfg.OUTPUT_SHEET].iter_rows(min_row=1, values_only=True))
+            rows = list(wb[OUTPUT_SHEET].iter_rows(min_row=1, values_only=True))
         finally:
             wb.close()
         engine = "openpyxl"
     log.info("Reading %s with %s", path.name, engine)
 
     if len(rows) < 2:
-        raise ValueError(f"{path.name}: sheet '{cfg.OUTPUT_SHEET}' has no data rows")
+        raise ValueError(f"{path.name}: sheet '{OUTPUT_SHEET}' has no data rows")
     header = [str(h).strip() if h is not None else "" for h in rows[0]]
-    keep = [i for i, h in enumerate(header) if h in REQUIRED_COLUMNS]
+    keep = [i for i, h in enumerate(header) if h in wanted]
     data = [[r[i] if i < len(r) else None for i in keep] for r in rows[2:]]
     return pd.DataFrame(data, columns=[header[i] for i in keep], dtype=object)
 
 
-def is_cv_export(path: Path) -> bool:
+def is_export(path: Path) -> bool:
     """True if `path` is an .xlsx with a sheet "Output" (cheap: sheet names only)."""
     if path.suffix.lower() not in (".xlsx", ".xlsm") or path.name.startswith("~$"):
         return False
     try:
         if importlib.util.find_spec("python_calamine") is not None:
             from python_calamine import CalamineWorkbook
-            return cfg.OUTPUT_SHEET in CalamineWorkbook.from_path(str(path)).sheet_names
+            return OUTPUT_SHEET in CalamineWorkbook.from_path(str(path)).sheet_names
         import openpyxl
         wb = openpyxl.load_workbook(path, read_only=True)
         try:
-            return cfg.OUTPUT_SHEET in wb.sheetnames
+            return OUTPUT_SHEET in wb.sheetnames
         finally:
             wb.close()
     except Exception:  # unreadable / not a workbook
         return False
+
+
+def measurement_exports(path: str | Path) -> list[Path]:
+    """
+    The export files of one measurement: `path` itself if it is a file; for
+    a folder every xlsx with a sheet "Output", or Output.txt if there is none.
+    """
+    path = Path(path)
+    if path.is_file():
+        return [path]
+    xlsx = [p for p in sorted(path.glob("*.xls[xm]")) if is_export(p)]
+    return xlsx or [path / "Output.txt"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,7 +212,7 @@ def find_mass_file(export_path: Path) -> Path:
     there are several, the one whose name starts with the export's stem.
     """
     folder = export_path.parent
-    candidates = sorted(folder.glob(cfg.MASS_FILE_PATTERN))
+    candidates = sorted(folder.glob(MASS_FILE_PATTERN))
     if not candidates:
         raise FileNotFoundError(
             f"No Input-Variables.txt next to {export_path.name} in {folder} -- "
@@ -221,10 +269,10 @@ def read_masses(path: str | Path) -> dict:
             unit = "g"
             log.info("%s: no unit given for %s; assuming g (EL-Cell convention)", path.name, name)
         grams = value / 1000.0 if unit.lower() == "mg" else value
-        if not (cfg.MASS_MIN_G <= grams <= cfg.MASS_MAX_G):
+        if not (MASS_MIN_G <= grams <= MASS_MAX_G):
             raise ValueError(
                 f"{path.name}: {name} = {value} {unit} = {grams:g} g is outside the plausible "
-                f"range {cfg.MASS_MIN_G:g}-{cfg.MASS_MAX_G:g} g -- check the unit.")
+                f"range {MASS_MIN_G:g}-{MASS_MAX_G:g} g -- check the unit.")
         result[f"{name}_g"] = grams
         result[f"{name}_raw"] = f"{e['raw']} {unit}"
 

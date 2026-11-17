@@ -77,11 +77,11 @@ def test_run_experiment_dispatches_per_subfolder(tmp_path, monkeypatch):
     calls = {"cv": [], "gcd": []}
     monkeypatch.setattr(
         "supercap_pipeline.pipeline.run",
-        lambda folder, output_dir=None: calls["cv"].append(Path(folder).name),
+        lambda folder, output_dir=None, **kw: calls["cv"].append(Path(folder).name),
     )
     monkeypatch.setattr(
         "supercap_pipeline.pipeline.run_gcd",
-        lambda folder, output_dir=None, basis=None: calls["gcd"].append((Path(folder).name, basis)),
+        lambda folder, output_dir=None, basis=None, **kw: calls["gcd"].append((Path(folder).name, basis)),
     )
 
     run_experiment(cell_folder, gcd_basis="total_active_mass")
@@ -101,10 +101,12 @@ def test_detect_technique_eis_by_step_type(tmp_path):
     assert detect_technique(folder) == "eis"
 
 
-def test_detect_technique_charge_only_is_not_gcd(tmp_path):
+def test_detect_technique_any_cc_step_is_gcd(tmp_path):
+    # lab guide GCD: decided per file from the step types (CC -> GCD); a
+    # charge-only file goes to the GCD module, which reports that it has no cycles
     folder = tmp_path / "02_step"
     _write_output_txt(folder, ["0.0\t1\t20\tCC\tc\t0.0\t1.0"])
-    assert detect_technique(folder) == "unknown"
+    assert detect_technique(folder) == "gcd"
 
 
 def test_run_experiment_finds_nested_measurements_from_experiment_root(tmp_path, monkeypatch):
@@ -120,7 +122,7 @@ def test_run_experiment_finds_nested_measurements_from_experiment_root(tmp_path,
     calls = []
     monkeypatch.setattr(
         "supercap_pipeline.pipeline.run",
-        lambda folder, output_dir=None: calls.append((Path(folder), output_dir)),
+        lambda folder, output_dir=None, **kw: calls.append((Path(folder), output_dir)),
     )
 
     out = tmp_path / "out"
@@ -130,11 +132,9 @@ def test_run_experiment_finds_nested_measurements_from_experiment_root(tmp_path,
         Path("BIA-VR-017-01/A0001/01_Cyclic Voltametry"),
         Path("BIA-VR-017-02/A0002/01_Cyclic Voltametry"),
     ]
-    # several measurements + explicit -o -> separate subdirectories, no overwriting
-    assert [o for _, o in calls] == [
-        out / "BIA-VR-017-01/A0001/01_Cyclic Voltametry",
-        out / "BIA-VR-017-02/A0002/01_Cyclic Voltametry",
-    ]
+    # explicit -o is the output root for every measurement; results are kept
+    # apart by <sample-id>/<technique> (see pipeline.output_dir_for)
+    assert [o for _, o in calls] == [out, out]
 
 
 def test_run_experiment_on_single_measurement_folder(tmp_path, monkeypatch):
@@ -144,7 +144,7 @@ def test_run_experiment_on_single_measurement_folder(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
         "supercap_pipeline.pipeline.run",
-        lambda folder, output_dir=None: calls.append((Path(folder), output_dir)),
+        lambda folder, output_dir=None, **kw: calls.append((Path(folder), output_dir)),
     )
 
     run_experiment(folder, output_dir=tmp_path / "out")
@@ -158,7 +158,7 @@ def test_run_experiment_continues_after_failure(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_run(folder, output_dir=None):
+    def fake_run(folder, output_dir=None, **kw):
         calls.append(Path(folder).parent.name)
         if Path(folder).parent.name == "A0001":
             raise FileNotFoundError("No info.json found")

@@ -1,126 +1,102 @@
 """
 pipeline.py
 -----------
-Orchestrates the full analysis for one experiment folder -- CV (cyclic
-voltammetry, run()) or GCD (galvanostatic charge/discharge, run_gcd()).
+Orchestrates the evaluation of one measurement -- CV (cyclic voltammetry,
+run()) or GCD (galvanostatic charge/discharge, run_gcd()) -- and of whole
+experiment folders (run_experiment()).
 
-run_experiment() dispatches across a whole cell folder that may contain
-both kinds of measurement as step subfolders: it looks at each
-subfolder's Output.txt content (not its name) to decide which pipeline
-applies, and runs both where present.
+The technique is decided per file from the step types in the export
+(VS = voltage sweep -> CV, CC = constant current -> GCD; impedance steps
+-> skipped), never from folder names.
+
+Output layout: <root>/<sample-id>/cv/ and <root>/<sample-id>/gcd/, where
+<root> is the -o folder or, by default, <parent of the measurement>/output/.
+A second measurement of the same technique for the same sample gets the
+measurement folder name as suffix (gcd_<folder>).
 """
 
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
+import re
 from pathlib import Path
 
+import pandas as pd
+
 from . import cv_config
-from .loader       import read_tester_txt
-from .cv_io        import find_mass_file, is_cv_export, read_export, read_masses, sample_id_for
+from . import gcd_analysis as gana
+from . import gcd_output as gout
+from . import gcd_plots as gplots
+from . import gcd_segmentation as gseg
+from .export_io import (
+    GCD_COLUMNS, find_mass_file, is_export, measurement_exports, read_export, read_masses,
+    sample_id_for, step_types,
+)
+from .plot_style import PlotContext
 from .cv_segmentation import detect_blocks, drop_transition_sweeps, find_sweeps, pair_cycles
-from .cv_analysis  import evaluate_blocks
-from .cv_output    import meta_table, results_table, summary_table, write_results
-from .plots        import plot_all
-from .gcd_loader   import load_gcd_experiment
-from .gcd_analysis import (
-    segment_steps,
-    compute_gcd_cycle_table,
-    compute_gcd_rate_aggregate,
-    compute_capacity_retention,
-    build_qc_report,
-)
-from .gcd_plots import (
-    plot_gcd_curves,
-    plot_capacitance_vs_current_density,
-    plot_capacitance_vs_cycle,
-    plot_capacity_retention,
-    plot_ragone,
-    plot_efficiency_esr_vs_cycle,
-)
+from .cv_analysis import evaluate_blocks
+from .cv_output import meta_table, results_table, summary_table, write_results
+from .cv_plots import plot_all
+from .run_log import evaluation_log
 
 log = logging.getLogger(__name__)
-
-
-def _default_output_dir(folder: Path) -> Path:
-    """
-    Derive  <experiment_root>/output/<cell_group>/<cell_tag>/  from a
-    measurement folder typically shaped  <exp>/<cell_group>/<cell_tag>/<step>/.
-    """
-    parts = folder.parts
-    try:
-        cell_tag   = parts[-2]          # e.g. "A7029"
-        cell_group = parts[-3]          # e.g. "BIA-BA-244-01"
-        exp_root   = Path(*parts[:-3])  # e.g. "C:/…/bat-pipeline/2026-…"
-    except IndexError:
-        exp_root   = folder.parent.parent
-        cell_group = folder.parent.name
-        cell_tag   = "output"
-    return exp_root / "output" / cell_group / cell_tag
+log_cv = logging.getLogger("supercap_pipeline.cv")
+log_gcd = logging.getLogger("supercap_pipeline.gcd")
 
 
 def detect_technique(folder: str | Path) -> str:
     """
-    Classify a measurement folder's Output.txt by content, not by folder
-    name (step-folder names are free text and not a reliable signal, e.g.
+    Classify a measurement (folder or export file) by the step types in its
+    export, not by folder name (step-folder names are free text, e.g.
     "01_Galvanostatic Polarization Method 2.5V(3)").
 
-    Returns "eis" for impedance measurements (any step type mentioning EIS
-    / impedance, or -- as a negative signal only -- "EIS" in the folder
-    name; PEIS steps often carry a few CC rows that would otherwise look
-    like GCD), "cv" if any row has type == "VS", "gcd" if there are CC rows
-    with both c/d == "c" and c/d == "d", else "unknown".
+    Returns "eis" for impedance measurements (a step type mentioning EIS /
+    impedance, or -- as a negative signal only -- "EIS" in the folder name;
+    PEIS steps often carry a few CC rows that would otherwise look like GCD),
+    "cv" if a step has type VS, "gcd" if a step has type CC, else "unknown".
     """
     folder = Path(folder)
-    out_file = folder / "Output.txt"
-    if not out_file.exists():
-        # xlsx export (sheet "Output"): only the CV pipeline reads these
-        for xlsx in xlsx_exports(folder):
-            if (read_export(xlsx)["type"] == "VS").any():
-                return "cv"
+    exports = [p for p in measurement_exports(folder) if p.exists()]
+    if not exports:
         return "unknown"
-
-    df = read_tester_txt(out_file)
-    types = df["type"].str.upper()
-    if types.str.contains("EIS|IMP|FRA", regex=True).any() or "EIS" in folder.name.upper():
+    types = {t.upper() for p in exports for t in step_types(p)}
+    if any(re.search("EIS|IMP|FRA", t) for t in types) or "EIS" in folder.name.upper():
         return "eis"
-    if (types == "VS").any():
+    if "VS" in types:
+        if "CC" in types:
+            log.warning("%s contains VS and CC steps; evaluated as CV", folder)
         return "cv"
-    cc_dirs = set(df.loc[types == "CC", "c/d"]) if "c/d" in df.columns else set()
-    if {"c", "d"} <= cc_dirs:
+    if "CC" in types:
         return "gcd"
     return "unknown"
 
 
-def run(
-    cv_folder: str | Path,
-    output_dir: str | Path | None = None,
-) -> None:
+def output_dir_for(export: Path, output_dir: str | Path | None, name: str) -> Path:
+    """<root>/<sample-id>/<name>; root = output_dir or <parent of the measurement>/output."""
+    measurement = export if export.suffix.lower() in (".xlsx", ".xlsm") else export.parent
+    root = Path(output_dir) if output_dir is not None else measurement.parent / "output"
+    return root / sample_id_for(export) / name
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CV
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run(cv_folder: str | Path, output_dir: str | Path | None = None,
+        out_name: str = "cv") -> None:
     """
     CV evaluation (lab guide method) for one measurement: a folder with
     Output.txt and/or xlsx exports (sheet "Output"), or one export file.
     Each xlsx export in a folder is evaluated; Output.txt only if the folder
     has no xlsx export. Mass file: Input-Variables.txt next to the export.
-
-    Results go to <output root>/<sample-id>/cv/ where the output root is
-    `output_dir` or, by default, <parent of the measurement>/output/.
+    Results go to <root>/<sample-id>/cv/ (see output_dir_for).
     """
-    cv_path = Path(cv_folder)
-    if cv_path.is_file():
-        exports = [cv_path]
-    else:
-        exports = xlsx_exports(cv_path) or [cv_path / "Output.txt"]
-    for export in exports:
-        run_cv_export(export, output_dir)
+    for export in measurement_exports(cv_folder):
+        run_cv_export(export, output_dir, out_name)
 
 
-def xlsx_exports(folder: Path) -> list[Path]:
-    """xlsx files in `folder` (not below) that have a sheet "Output"."""
-    return [p for p in sorted(folder.glob("*.xls[xm]")) if is_cv_export(p)]
-
-
-def run_cv_export(export: str | Path, output_dir: str | Path | None = None) -> dict:
+def run_cv_export(export: str | Path, output_dir: str | Path | None = None,
+                  out_name: str = "cv") -> dict:
     """
     Evaluate one export file:
       read_masses -> read_export -> find_sweeps -> drop_transition_sweeps
@@ -131,9 +107,7 @@ def run_cv_export(export: str | Path, output_dir: str | Path | None = None) -> d
     """
     export = Path(export)
     sample_id = sample_id_for(export)
-    measurement = export if export.suffix.lower() in (".xlsx", ".xlsm") else export.parent
-    root = Path(output_dir) if output_dir is not None else measurement.parent / "output"
-    out = root / sample_id / "cv"
+    out = output_dir_for(export, output_dir, out_name)
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'-'*60}")
@@ -142,7 +116,7 @@ def run_cv_export(export: str | Path, output_dir: str | Path | None = None) -> d
     print(f"  Output : {out}")
     print(f"{'-'*60}")
 
-    with _cv_log(out / "cv.log") as warnings:
+    with evaluation_log(out / "cv.log", log_cv.name) as warnings:
         try:
             masses = read_masses(find_mass_file(export))
             if abs(masses["m1_g"] - masses["m2_g"]) / masses["m_mean_g"] > cv_config.MASS_ASYMMETRY_TOL:
@@ -159,7 +133,7 @@ def run_cv_export(export: str | Path, output_dir: str | Path | None = None) -> d
             results = results_table(blocks, sample_id, export.name)
             summary = summary_table(blocks, sample_id, export.name)
             meta = meta_table(masses, sample_id, str(export), sweeps.attrs.get("n_dropped", 0))
-            paths = plot_all(df, blocks, masses, sample_id, out / "plots")
+            paths = plot_all(df, blocks, masses, sample_id, out / "plots", source_file=export.name)
             paths = write_results(out, results, summary, meta, list(warnings)) + paths
         except Exception as exc:
             log_cv.error("Evaluation of %s stopped: %s", export.name, exc)
@@ -181,144 +155,153 @@ def run_cv_export(export: str | Path, output_dir: str | Path | None = None) -> d
                 out=out, paths=paths, sweeps=sweeps, cycles=cycles, masses=masses)
 
 
-log_cv = logging.getLogger("supercap_pipeline.cv")
+# ─────────────────────────────────────────────────────────────────────────────
+# GCD
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-class _WarningCollector(logging.Handler):
-    def __init__(self, sink: list[str]):
-        super().__init__(level=logging.WARNING)
-        self.sink = sink
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self.sink.append(record.getMessage())
-
-
-@contextmanager
-def _cv_log(path: Path):
+def run_gcd(gcd_folder: str | Path, output_dir: str | Path | None = None,
+            basis: str | None = None, out_name: str = "gcd") -> None:
     """
-    Route every message of the CV modules (INFO and up: dropped sweeps,
-    unpaired sweeps, block decisions, flags, warnings) to `path`; warnings
-    also go to the console and to the yielded list (-> Warnings sheet).
+    GCD evaluation (lab guide method) for one measurement folder or export
+    file; results go to <root>/<sample-id>/gcd/. `basis` is accepted for
+    CLI compatibility but ignored: the guide fixes the mass convention
+    (j per m_mean, C_el = 2C/m_mean, E_sp and P_sp per m1 + m2).
     """
-    logger = log_cv
-    old = (logger.level, logger.propagate, list(logger.handlers))
-    fh = logging.FileHandler(path, mode="w", encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
-    console = logging.StreamHandler()
-    console.setLevel(logging.WARNING)
-    console.setFormatter(logging.Formatter("  %(levelname)s: %(message)s"))
-    sink: list[str] = []
-    logger.handlers = [fh, console, _WarningCollector(sink)]
-    logger.setLevel(logging.DEBUG if logging.getLogger().level <= logging.DEBUG else logging.INFO)
-    logger.propagate = False
-    try:
-        yield sink
-    finally:
-        fh.close()
-        logger.setLevel(old[0])
-        logger.propagate = old[1]
-        logger.handlers = old[2]
+    if basis is not None:
+        log.warning("--gcd-basis %s ignored: the lab-guide GCD method fixes the mass "
+                    "convention (m_mean = (m1 + m2)/2)", basis)
+    for export in measurement_exports(gcd_folder):
+        run_gcd_export(export, output_dir, out_name)
 
 
-def run_gcd(
-    gcd_folder: str | Path,
-    output_dir: str | Path | None = None,
-    basis: str | None = None,
-) -> None:
+def evaluate_gcd(df: pd.DataFrame, masses: dict, sample_dir: Path | None = None) -> dict:
     """
-    Full analysis pipeline for one galvanostatic charge/discharge (GCD)
-    measurement folder.
+    The GCD evaluation chain on an export DataFrame (read with GCD_COLUMNS):
+      find_steps / classify_steps (half-cycles, rests, holds) -> build_cycles
+      -> detect_blocks -> classify_tests -> mark_complete -> evaluate_cycles
+      -> cycle_checks -> select_cycles -> rate_summary -> compare_with_cv
+      (if `sample_dir` has cv/results.xlsx) -> longterm_cycling -> holds_table
+      -> longterm_floating.
+    """
+    steps = gseg.classify_steps(df, gseg.find_steps(df))
+    cycles = gseg.build_cycles(df, steps)
+    n_holds = int((steps["kind"] == gseg.HOLD).sum())
+    res = dict(steps=steps, n_holds=n_holds, ev=pd.DataFrame(), rate=pd.DataFrame(),
+               series_flags=[], cv_comparison=None, cyc_t=pd.DataFrame(), cycling=[],
+               holds=pd.DataFrame(), fl_t=pd.DataFrame(), floating=[])
+    if cycles.empty:
+        return res
+    cycles = gseg.detect_blocks(cycles)
+    cycles = gseg.classify_tests(cycles, has_holds=n_holds > 0)
+    cycles = gseg.mark_complete(cycles)
+    ev = gana.evaluate_cycles(df, cycles, masses)
+    ev["cycle_flags"] = gana.cycle_checks(ev)
+    selection = gseg.select_cycles(ev[ev["test_type"] == gseg.RATE])
+    rate, series_flags = gana.rate_summary(ev, selection)
+    cv_cmp = gana.compare_with_cv(sample_dir, rate) if sample_dir is not None else None
+    if cv_cmp:
+        (log_gcd.warning if cv_cmp["severity"] == gana.FLAG else log_gcd.info)(
+            "CV comparison: %s", cv_cmp["text"])
+    cyc_t, cyc_s = gana.longterm_cycling(ev)
+    holds = gana.holds_table(df, steps, masses)
+    fl_t, fl_s = gana.longterm_floating(ev, holds)
+    res.update(ev=ev, rate=rate, series_flags=series_flags, cv_comparison=cv_cmp,
+               cyc_t=cyc_t, cycling=cyc_s, holds=holds, fl_t=fl_t, floating=fl_s)
+    return res
 
-    Parameters
-    ----------
-    gcd_folder : path to the measurement folder (Output.txt + info.json
-                 with valid Weight1/Weight2 -- see
-                 gcd_loader.load_gcd_experiment())
-    output_dir : where to save CSVs, the QC report and PDFs; defaults to
-                 <experiment_root>/output/<cell_group>/<cell_tag>/
-    basis      : normalization convention; overrides info.json's
-                 `gcdConfig.basis`, one of the two is required
+
+def run_gcd_export(export: str | Path, output_dir: str | Path | None = None,
+                   out_name: str = "gcd") -> dict:
     """
-    gcd_folder = Path(gcd_folder)
-    output_dir = Path(output_dir) if output_dir is not None else _default_output_dir(gcd_folder)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    Evaluate one GCD export file (lab guide GCD):
+      read_masses -> read_export -> find_steps / classify_steps (half-cycles,
+      rests, holds) -> build_cycles -> detect_blocks -> classify_tests ->
+      mark_complete -> evaluate_cycles -> cycle_checks -> select_cycles ->
+      rate_summary / compare_with_cv / longterm_cycling / longterm_floating
+      -> results.xlsx (+ csv per sheet) + plots (+ xlsx per plot) + gcd.log.
+    Stops with an error if the masses are missing.
+    """
+    export = Path(export)
+    sample_id = sample_id_for(export)
+    out = output_dir_for(export, output_dir, out_name)
+    out.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'-'*60}")
-    print(f"  Supercap GCD Pipeline")
-    print(f"  Folder : {gcd_folder}")
-    print(f"  Output : {output_dir}")
+    print("  Supercap GCD Pipeline (lab-guide method)")
+    print(f"  Export : {export}")
+    print(f"  Output : {out}")
     print(f"{'-'*60}")
 
-    # ── 1. Load ───────────────────────────────────────────────────────────────
-    df, meta = load_gcd_experiment(gcd_folder, basis=basis)
+    with evaluation_log(out / "gcd.log", log_gcd.name) as warnings:
+        try:
+            masses = read_masses(find_mass_file(export))
+            df = read_export(export, GCD_COLUMNS)
+            res = evaluate_gcd(df, masses, sample_dir=out.parent)
+            if res["ev"].empty:
+                log_gcd.warning("No GCD cycle (charge followed by discharge) found in %s",
+                                export.name)
+            ev, rate, n_holds = res["ev"], res["rate"], res["n_holds"]
+            series_flags, cv_cmp = res["series_flags"], res["cv_comparison"]
+            cyc_t, cyc_s, fl_t, fl_s = res["cyc_t"], res["cycling"], res["fl_t"], res["floating"]
+            holds, steps = res["holds"], res["steps"]
 
-    print(f"\n  Cell tag    : {meta['cell_tag']}")
-    print(f"  Experiment  : {meta['exp_name']}")
-    print(f"  Electrode 1 : {meta['e1_name']}  m1 = {meta['m1_g']*1000:.3f} mg")
-    print(f"  Electrode 2 : {meta['e2_name']}  m2 = {meta['m2_g']*1000:.3f} mg")
-    print(f"  Electrolyte : {meta['electrolyte']}")
-    print(f"  Basis       : {meta['basis']}")
+            sheets = {
+                "Cycles": gout.cycles_table(ev) if len(ev) else pd.DataFrame(),
+                "Rate": gout.rate_table(rate, ev),
+                "Cycling": cyc_t, "Floating": fl_t, "Holds": holds,
+                "Flags": gout.flags_table(ev, rate, series_flags, cv_cmp, cyc_s, fl_s)
+                if len(ev) else pd.DataFrame(columns=["severity", "flag"]),
+                "Meta": gout.meta_table(masses, sample_id, str(export), ev, n_holds, cv_cmp,
+                                        cyc_s, fl_s),
+            }
+            for f in sheets["Flags"].itertuples():
+                log_gcd.info("%s [block %s, cycle %s]: %s", f.severity,
+                             "-" if pd.isna(f.block) else int(f.block),
+                             "-" if pd.isna(f.cycle) else int(f.cycle), f.flag)
+            ctx = PlotContext(sample_id=sample_id, source_file=export.name, masses=masses,
+                              out=out / "plots")
+            paths = gplots.plot_all(df, ev, rate, cyc_t, fl_t, ctx) if len(ev) else []
+            sheets["Warnings"] = pd.DataFrame({"warning": list(warnings) or ["(none)"]})
+            paths = gout.write_results(out, sheets) + paths
+        except Exception as exc:
+            log_gcd.error("Evaluation of %s stopped: %s", export.name, exc)
+            raise
 
-    # ── 2. Analysis ───────────────────────────────────────────────────────────
-    print("\n  Segmenting steps and computing per-cycle GCD metrics …")
-    cycle_df, steps_df = compute_gcd_cycle_table(df, meta)
-
-    print(f"\n  Per-cycle table ({len(cycle_df)} complete cycles):")
-    print(cycle_df[[
-        "cycle", "rate_group", "i_nominal_mA", "esr_Ohm", "esr_variant",
-        "C_spec_slope", "C_spec_integral", "coulomb_eff_charge", "energy_eff",
-        "ocv_start",
-    ]].to_string(index=False))
-
-    rate_df = compute_gcd_rate_aggregate(cycle_df, exclude_first_cycle=True)
-    print(f"\n  Mean per rate stage (first cycle of each stage excluded):")
-    print(rate_df.to_string(index=False))
-
-    retention_df = compute_capacity_retention(rate_df)
-    print(f"\n  Capacity retention vs. lowest rate stage:")
-    print(retention_df.to_string(index=False))
-
-    qc_text = build_qc_report(cycle_df, steps_df)
-    print(f"\n{qc_text}")
-
-    # Save CSVs + QC report
-    cycle_df.to_csv(output_dir / "gcd_cycle_table.csv", index=False)
-    rate_df.to_csv(output_dir / "gcd_rate_aggregate.csv", index=False)
-    (output_dir / "gcd_qc_report.txt").write_text(qc_text, encoding="utf-8")
-    # retention_df's own CSV is saved by plot_capacity_retention() below (capacity_retention.csv)
-    print(f"\n  Saved CSVs + QC report -> {output_dir}")
-
-    # ── 3. Plots ──────────────────────────────────────────────────────────────
-    print("\n  Generating GCD plots …")
-    df_with_steps, _ = segment_steps(df)  # step_id column, needed by plot_gcd_curves
-    paths = plot_gcd_curves(df_with_steps, cycle_df, steps_df, meta, output_dir)
-    paths += plot_capacitance_vs_current_density(cycle_df, output_dir, meta)
-    paths += plot_capacitance_vs_cycle(cycle_df, output_dir, meta)
-    paths += plot_capacity_retention(retention_df, output_dir, meta)
-    paths += plot_ragone(cycle_df, output_dir, meta)
-    paths += plot_efficiency_esr_vs_cycle(cycle_df, output_dir, meta)
-
-    by_ext: dict[str, list[str]] = {}
-    for p in paths:
-        by_ext.setdefault(p.suffix, []).append(p.name)
-    print(f"\n  Saved {len(paths)} files:")
-    for ext in sorted(by_ext):
-        print(f"    {ext}: {', '.join(sorted(by_ext[ext]))}")
-
-    print(f"\n{'-'*60}")
-    print("  Done.")
+    print(f"\n  m1 = {masses['m1_g'] * 1000:.4g} mg, m2 = {masses['m2_g'] * 1000:.4g} mg, "
+          f"m_mean = {masses['m_mean_g'] * 1000:.4g} mg  ({Path(masses['source']).name})")
+    if len(ev):
+        prog = ev.groupby("block").agg(
+            test=("test_type", "first"), j_Ag=("j_block_Ag", "first"), cycles=("cycle", "size"),
+            used=("used", "sum"), U_min=("U_min", "first"), U_max=("U_max_block", "first"))
+        print(f"  {len(ev)} cycles, {len(prog)} blocks, {n_holds} voltage holds\n")
+        print(prog.to_string(float_format=lambda x: f"{x:.4g}"))
+        if not rate.empty and "C" in rate:
+            cols = ["block", "j_block_Ag", "selected_cycle", "ESR", "C", "C_E", "C_el",
+                    "retention_pct", "eta_C", "E_sp", "P_sp"]
+            print("\n  Rate series (selected cycles):")
+            print(rate[[c for c in cols if c in rate]].to_string(
+                index=False, float_format=lambda x: f"{x:.4g}"))
+        n_flag = int((sheets["Flags"]["severity"] == gana.FLAG).sum())
+        print(f"\n  {n_flag} flag(s), see sheet Flags / gcd.log")
+    print(f"\n  Saved {len(paths)} files to {out}")
     print(f"{'-'*60}\n")
+    return dict(ev=ev, rate=rate, sheets=sheets, cycling=cyc_s, floating=fl_s,
+                cv_comparison=cv_cmp, out=out, paths=paths, masses=masses, steps=steps)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Experiment folders
+# ─────────────────────────────────────────────────────────────────────────────
 
 def find_measurement_folders(root: str | Path) -> list[Path]:
     """
-    Every folder at or below `root` that directly contains an Output.txt,
-    sorted by path. Lets the CLI accept an experiment, cell-group, cell or
-    single-measurement folder alike.
+    Every folder at or below `root` that directly contains an Output.txt or
+    an xlsx export (sheet "Output"), sorted by path. Lets the CLI accept an
+    experiment, cell-group, cell or single-measurement folder alike.
     """
     root = Path(root)
     found = {p.parent for p in root.rglob("Output.txt") if p.is_file()}
-    found |= {p.parent for p in root.rglob("*.xls[xm]") if is_cv_export(p)}
+    found |= {p.parent for p in root.rglob("*.xls[xm]") if is_export(p)}
     return sorted(found)
 
 
@@ -328,32 +311,34 @@ def run_experiment(
     gcd_basis: str | None = None,
 ) -> None:
     """
-    Run CV and/or GCD analysis for every measurement folder at or below
-    `cell_folder` (an experiment, cell-group or cell folder), dispatching
-    per folder based on detect_technique(). Impedance (EIS) folders and
-    folders matching neither technique are skipped; a folder that fails
-    to analyze is reported and does not stop the remaining ones.
-    `gcd_basis` is passed to run_gcd() as the normalization convention.
-
-    If `output_dir` is given and several measurements are found, each one
-    writes to `output_dir/<path relative to cell_folder>` so results don't
-    overwrite each other. Without it, each measurement uses its own
-    default output directory.
+    Run CV and/or GCD evaluation for every measurement at or below
+    `cell_folder` (an experiment, cell-group, cell or measurement folder, or
+    a single export file), dispatching per measurement on detect_technique().
+    Impedance (EIS) folders and folders matching neither technique are
+    skipped; a measurement that fails is reported and does not stop the
+    others. Results: <root>/<sample-id>/<technique>/ (see output_dir_for); a
+    second measurement of the same technique and sample gets the suffix
+    _<measurement folder name>.
     """
     cell_folder = Path(cell_folder)
-    if cell_folder.is_file():  # a single CV export (.xlsx or Output.txt)
-        run(cell_folder, output_dir=output_dir)
+    if cell_folder.is_file():
+        technique = detect_technique(cell_folder)
+        if technique == "gcd":
+            run_gcd(cell_folder, output_dir=output_dir, basis=gcd_basis)
+        else:
+            run(cell_folder, output_dir=output_dir)
         return
     measurements = find_measurement_folders(cell_folder)
 
     print(f"\n{'='*60}")
-    print(f"  Supercap Experiment Dispatch")
+    print("  Supercap Experiment Dispatch")
     print(f"  Folder      : {cell_folder}")
-    print(f"  Measurements: {len(measurements)} folder(s) with Output.txt")
+    print(f"  Measurements: {len(measurements)} folder(s) with an export")
     print(f"{'='*60}")
 
     ran = 0
     failed: list[tuple[Path, Exception]] = []
+    seen: set[tuple[str, str]] = set()
     for sub in measurements:
         rel = sub.relative_to(cell_folder)
         technique = detect_technique(sub)
@@ -363,25 +348,25 @@ def run_experiment(
             print("    impedance measurement -- not analyzed by this pipeline, skipped.")
             continue
         if technique == "unknown":
-            log.warning("Skipping %s: could not determine technique from Output.txt content.", sub)
+            log.warning("Skipping %s: could not determine technique from the export content.", sub)
             continue
 
-        sub_out = None
-        if output_dir is not None:
-            sub_out = Path(output_dir) if len(measurements) == 1 else Path(output_dir) / rel
+        sample = sample_id_for(measurement_exports(sub)[0])
+        out_name = technique if (sample, technique) not in seen else f"{technique}_{sub.name}"
+        seen.add((sample, technique))
 
         try:
             if technique == "cv":
-                run(sub, output_dir=sub_out)
+                run(sub, output_dir=output_dir, out_name=out_name)
             else:
-                run_gcd(sub, output_dir=sub_out, basis=gcd_basis)
+                run_gcd(sub, output_dir=output_dir, basis=gcd_basis, out_name=out_name)
             ran += 1
         except Exception as exc:
             log.exception("Analysis failed for %s", sub)
             failed.append((sub, exc))
 
     if not measurements:
-        log.warning("No folders containing Output.txt found in %s.", cell_folder)
+        log.warning("No folders with an export (Output.txt / xlsx) found in %s.", cell_folder)
 
     print(f"\n{'='*60}")
     print(f"  Experiment dispatch done: {ran} measurement(s) analyzed.")

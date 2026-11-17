@@ -3,11 +3,13 @@ cli.py
 ------
 Command-line entry point:
 
-    supercap-run  <folder>  [-o output_dir]  [--gcd-basis BASIS]
+    supercap-run  <folder or export file>  [-o output_dir]
 
-<folder> can be a single measurement folder (Output.txt + info.json) or any
-parent of one -- a cell, cell-group or whole experiment folder. Every
-measurement found below it is analyzed as CV or GCD based on its content.
+<folder> can be a single measurement folder (Output.txt or xlsx export plus
+Input-Variables.txt) or any parent of one -- a cell, cell-group or whole
+experiment folder. Every measurement found below it is evaluated as CV or
+GCD, decided per file from its step types (VS -> CV, CC -> GCD).
+Results: <output_dir>/<sample-id>/cv/ and .../gcd/.
 """
 
 from __future__ import annotations
@@ -16,8 +18,10 @@ import argparse
 import logging
 from pathlib import Path
 
-from .gcd_loader import VALID_BASES
 from .pipeline import run_experiment
+
+# accepted for backwards compatibility only (ignored, see pipeline.run_gcd)
+LEGACY_GCD_BASES = ("cell", "single_electrode", "total_active_mass")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -31,23 +35,21 @@ def main(argv: list[str] | None = None) -> None:
             "A measurement folder containing Output.txt or a PAT-Tester .xlsx export "
             "(e.g. '.../A7029/01_Cyclic Voltametry'), any parent folder "
             "(cell / cell group / experiment) -- all measurements below it are run -- "
-            "or a single CV export file (.xlsx / Output.txt)."
+            "or a single export file (.xlsx / Output.txt)."
         ),
     )
     parser.add_argument(
         "-o", "--output",
         default=None,
         metavar="DIR",
-        help="Output directory for CSVs and PDFs (default: auto-derived from folder path).",
+        help=("Output root; results go to DIR/<sample-id>/cv and DIR/<sample-id>/gcd "
+              "(default: an 'output' folder next to each measurement folder)."),
     )
     parser.add_argument(
         "--gcd-basis",
-        choices=sorted(VALID_BASES),
+        choices=LEGACY_GCD_BASES,
         default=None,
-        help=(
-            "Mass normalization for GCD specific values. Required for GCD "
-            "measurements unless info.json has gcdConfig.basis; overrides it if given."
-        ),
+        help="Ignored (kept for compatibility): the lab-guide GCD method fixes the mass basis.",
     )
     parser.add_argument(
         "-v", "--verbose",

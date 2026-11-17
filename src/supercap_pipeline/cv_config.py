@@ -9,12 +9,10 @@ no cycle numbers, step numbers, scan rates, windows or masses.
 
 from __future__ import annotations
 
-# ── 1. Input data ────────────────────────────────────────────────────────────
-OUTPUT_SHEET = "Output"            # sheet holding the raw data in the xlsx export
-EXCEL_FIRST_DATA_ROW = 3           # row 1 = names, row 2 = units -> data from row 3
-MASS_FILE_PATTERN = "*Input-Variables*.txt"
-MASS_MIN_G = 1e-4                  # plausibility range of one electrode mass [g];
-MASS_MAX_G = 1.0                   # outside it the unit is probably not g -> error
+# ── 1. Input data (shared with GCD, defined in export_io) ────────────────────
+from .export_io import (  # noqa: E402  (re-exported so the Meta sheet lists them)
+    OUTPUT_SHEET, EXCEL_FIRST_DATA_ROW, MASS_FILE_PATTERN, MASS_MIN_G, MASS_MAX_G,
+)
 
 # ── 2. Segmentation ──────────────────────────────────────────────────────────
 TRANSITION_MIN_FRACTION = 0.50     # drop sweep if |dV| < 50 % of the neighbours' window
@@ -42,10 +40,10 @@ SCAN_RATE_TREND_TOL = 0.02         # C rising with nu by > 2 % -> flag the faste
 MAGNITUDE_RATIO_MIN = 0.3          # C / C_est outside [0.3, 3] -> "possible unit error"
 MAGNITUDE_RATIO_MAX = 3.0
 
-# ── 6. Outputs ───────────────────────────────────────────────────────────────
-PLOT_DPI = 300
+# ── 6. Outputs (shared plot style) ───────────────────────────────────────────
+from .plot_style import PLOT_DPI  # noqa: E402
 
 
 def tolerances() -> dict[str, float | int | str]:
     """All constants above as {name: value}, for the Meta sheet."""
-    return {k: v for k, v in globals().items() if k.isupper()}
+    return {k: v for k, v in globals().items() if k.isupper() and not callable(v)}
