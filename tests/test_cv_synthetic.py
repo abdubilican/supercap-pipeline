@@ -147,6 +147,24 @@ def test_end_to_end_txt_and_xlsx_agree(tmp_path):
             "normalised_pm1.00V.png"} <= pngs
     assert len([p for p in pngs if p.startswith("control_block")]) == 2
     assert len(list((out / "plots").glob("*.svg"))) == len(pngs)
+    assert {p.name[:-4] for p in (out / "plots").glob("*.csv")} == {p[:-4] for p in pngs}
+    csv_text = (out / "plots" / "cv_1mVs.csv").read_text(encoding="utf-8-sig")
+    assert csv_text.splitlines()[0] == "V12 (V);I12/m_mean (A/g);cycle;Qcd (mAh)"
+    assert "e-" not in csv_text  # no exponent notation
+    cv1 = pd.read_csv(out / "plots" / "cv_1mVs.csv", sep=";", encoding="utf-8-sig")
+    m_mean = r_xl["masses"]["m_mean_g"]
+    b = r_xl["blocks"][0]
+    src = pd.read_excel(xl_dir / "SYN-001.xlsx", sheet_name="Output", skiprows=[1])
+    src.columns = [c.strip() for c in src.columns]
+    first = src.iloc[b["up"]["row_start"] - 3]  # first plotted row = start of the up sweep
+    assert cv1["V12 (V)"].iloc[0] == pytest.approx(first.V12)
+    assert cv1["I12/m_mean (A/g)"].iloc[0] == pytest.approx(first.I12 / (1000 * m_mean))
+    assert cv1["Qcd (mAh)"].iloc[0] == pytest.approx(first.Qcd)
+    assert cv1["cycle"].iloc[0] == first.cycle
+    ctrl = pd.read_csv(next((out / "plots").glob("control_block01_*.csv")),
+                       sep=";", encoding="utf-8-sig")
+    assert (ctrl["point"] == "0 V crossing (interpolated)").sum() == 2
+    assert set(ctrl["discharge_area"].dropna()) == {"+", "-"}
 
     # Excel rows point at the right raw rows: re-interpolate from the raw sheet
     raw = pd.read_excel(xl_dir / "SYN-001.xlsx", sheet_name="Output", header=0, skiprows=[1])

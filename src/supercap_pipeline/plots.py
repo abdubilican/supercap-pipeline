@@ -11,6 +11,8 @@ Figures of the CV evaluation (lab guide 6.2), saved as PNG (300 dpi) + SVG:
 5. normalised_<window>  2*I12[A] / (nu[V/s] * m_mean[g]) vs V12, all scan rates
 
 One fixed colour per window in every figure; a sequential palette for scan rates.
+Every figure also gets a <name>.csv with the data drawn in it (with Excel row,
+instrument cycle and Qcd for the curve plots).
 
 _save_fig() (PDF + PNG) and the rcParams below are also used by gcd_plots.py.
 """
@@ -27,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from . import cv_config as cfg
+from .cv_output import write_csv
 from .cv_segmentation import SYMMETRIC
 
 plt.rcParams.update({
@@ -62,14 +65,37 @@ def _save_fig(fig: plt.Figure, base: Path) -> tuple[Path, Path]:
     return pdf, png
 
 
-def _save_png_svg(fig: plt.Figure, base: Path) -> list[Path]:
-    """Save as PNG (PLOT_DPI) and SVG; close the figure."""
+def _save_png_svg(fig: plt.Figure, base: Path, data: pd.DataFrame | None = None) -> list[Path]:
+    """Save as PNG (PLOT_DPI) and SVG, plus `data` as <base>.csv; close the figure."""
     png = Path(str(base) + ".png")
     svg = Path(str(base) + ".svg")
     fig.savefig(png, bbox_inches="tight", dpi=cfg.PLOT_DPI)
     fig.savefig(svg, bbox_inches="tight")
     plt.close(fig)
-    return [png, svg]
+    paths = [png, svg]
+    if data is not None:
+        paths.append(write_csv(data, Path(str(base) + ".csv")))
+    return paths
+
+
+def _curve_data(df: pd.DataFrame, b: dict) -> pd.DataFrame:
+    """Rows of the evaluated cycle with block identification, for the plot CSVs."""
+    cyc = _cycle_frame(df, b)
+    up_rows = set(range(b["up_sweep"].row_start, b["up_sweep"].row_end + 1))
+    return pd.DataFrame({
+        "window": window_label(window_key(b)),
+        "U_max_V": b["U_max"],
+        "nu_nom_mVs": b["nu_nom_mVs"],
+        "block": b["block"],
+        "occurrence": b["occurrence"],
+        "excel_row": cyc["excel_row"].to_numpy(),
+        "cycle": cyc["cycle"].to_numpy(),
+        "step": cyc["step"].to_numpy(),
+        "sweep": ["up" if r in up_rows else "down" for r in cyc["excel_row"]],
+        "V12_V": cyc["V12"].to_numpy(),
+        "I12_mA": cyc["I12"].to_numpy(),
+        "Qcd_mAh": cyc["Qcd"].to_numpy(),
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,19 +166,31 @@ def _last_occurrence(blocks: list[dict]) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_cv_per_scan_rate(df, blocks, masses, sample_id, out: Path) -> list[Path]:
-    """j = I12[mA] / (1000 * m_mean[g]) vs V12; one figure per nominal nu."""
+    """
+    j = I12[mA] / (1000 * m_mean[g]) vs V12; one figure per nominal nu.
+    CSV, exactly four columns: V12 (V) | I12/m_mean (A/g) | cycle | Qcd (mAh),
+    one row per data point of the plotted cycles (windows follow each other;
+    they are told apart by the instrument cycle number).
+    """
     styles = window_styles(blocks)
     last = _last_occurrence(blocks)
     paths = []
     for nu in sorted({b["nu_nom_mVs"] for b in blocks}):
         fig, ax = plt.subplots(figsize=(6.4, 4.6))
+        data = []
         for key in styles:
             b = last.get((key, nu))
             if b is None:
                 continue
-            cyc = _cycle_frame(df, b)
-            j = cyc["I12"] / (1000.0 * masses["m_mean_g"])
-            ax.plot(cyc["V12"], j, color=styles[key][0], linewidth=1.4,
+            d = _curve_data(df, b)
+            j = d["I12_mA"] / (1000.0 * masses["m_mean_g"])
+            data.append(pd.DataFrame({
+                "V12 (V)": d["V12_V"],
+                "I12/m_mean (A/g)": j,
+                "cycle": d["cycle"],
+                "Qcd (mAh)": d["Qcd_mAh"],
+            }))
+            ax.plot(d["V12_V"], j, color=styles[key][0], linewidth=1.4,
                     label=f"{window_label(key)} (cycle {b['up']['cycle']})")
         _style_axes(ax)
         ax.set_xlabel("Cell voltage V12 (V)")
@@ -160,7 +198,7 @@ def plot_cv_per_scan_rate(df, blocks, masses, sample_id, out: Path) -> list[Path
         ax.set_title(f"CV at {nu:g} mV s⁻¹ — last complete cycle per window", loc="left")
         ax.legend(title="Window", frameon=False)
         _subtitle(fig, sample_id, masses)
-        paths += _save_png_svg(fig, out / f"cv_{nu:g}mVs")
+        paths += _save_png_svg(fig, out / f"cv_{nu:g}mVs", pd.concat(data, ignore_index=True))
     return paths
 
 
@@ -234,7 +272,43 @@ def plot_control(df, b, masses, sample_id, out: Path) -> list[Path]:
     _subtitle(fig, sample_id, masses)
     occ = f"_occ{b['occurrence']}" if b["occurrence"] > 1 else ""
     return _save_png_svg(
-        fig, out / f"control_block{b['block']:02d}_{window_slug(key)}_{b['nu_nom_mVs']:g}mVs{occ}")
+        fig, out / f"control_block{b['block']:02d}_{window_slug(key)}_{b['nu_nom_mVs']:g}mVs{occ}",
+        _control_data(df, b))
+
+
+def _control_data(df: pd.DataFrame, b: dict) -> pd.DataFrame:
+    """
+    CSV of the control plot: every row of the evaluated cycle with the
+    discharge area it is shaded in ("+" / "-" / ""), followed by the
+    interpolated 0 V points (excel_row empty, point = "0 V crossing").
+    """
+    d = _curve_data(df, b)
+    d["discharge_area"] = ""
+    d["point"] = "data"
+    sym = b["window_type"] == SYMMETRIC
+    if sym:
+        for p, name in (("+", "down"), ("-", "up")):
+            row_a = b[name]["row_a"]
+            if np.isfinite(row_a):
+                d.loc[(d["sweep"] == name) & (d["excel_row"] <= row_a), "discharge_area"] = p
+    else:
+        d.loc[d["sweep"] == "down", "discharge_area"] = "+"
+    extra = []
+    if sym:
+        for p, name in (("+", "down"), ("-", "up")):
+            rec = b[name]
+            if np.isfinite(rec["Q0"]):
+                extra.append({**d.iloc[0][["window", "U_max_V", "nu_nom_mVs", "block",
+                                           "occurrence"]].to_dict(),
+                              "excel_row": np.nan, "cycle": rec["cycle"], "step": rec["step"],
+                              "sweep": name, "V12_V": 0.0, "I12_mA": rec["I0"],
+                              "Qcd_mAh": rec["Q0"] + rec["Qcd_first"],
+                              "discharge_area": p, "point": "0 V crossing (interpolated)"})
+    if extra:
+        d = pd.concat([d, pd.DataFrame(extra)], ignore_index=True)
+    d["not_evaluable"] = d["discharge_area"].map(
+        lambda p: bool(b["pol"][p]["not_evaluable"]) if p in b["pol"] else False)
+    return d
 
 
 def plot_rate_capability(blocks, masses, sample_id, out: Path) -> list[Path]:
@@ -242,10 +316,18 @@ def plot_rate_capability(blocks, masses, sample_id, out: Path) -> list[Path]:
     styles = window_styles(blocks)
     last = _last_occurrence(blocks)
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6.4, 7.0), sharex=True)
+    rows = []
     for key, (color, marker) in styles.items():
-        pts = sorted((nu, b) for (k, nu), b in last.items() if k == key)
+        pts = sorted(((nu, b) for (k, nu), b in last.items() if k == key), key=lambda t: t[0])
         good = [(nu, b["C_el"]) for nu, b in pts if np.isfinite(b["C_el"])]
         omitted = [nu for nu, b in pts if not np.isfinite(b["C_el"])]
+        ref = good[0][1] if good else np.nan
+        rows += [dict(window=window_label(key), U_max_V=key[1], nu_nom_mVs=nu,
+                      nu_meas_mVs=b["nu_meas_Vs"] * 1000.0, block=b["block"],
+                      occurrence=b["occurrence"], C_F=b["C"], C_el_Fg=b["C_el"],
+                      retention_pct=100.0 * b["C_el"] / ref,
+                      evaluable=bool(np.isfinite(b["C_el"])))
+                 for nu, b in pts]
         label = window_label(key)
         if omitted:
             label += f" (n.e. at {', '.join(f'{x:g}' for x in omitted)} mV/s omitted)"
@@ -265,7 +347,7 @@ def plot_rate_capability(blocks, masses, sample_id, out: Path) -> list[Path]:
     ax1.set_title("Rate capability", loc="left")
     ax1.legend(title="Window", frameon=False)
     _subtitle(fig, sample_id, masses)
-    return _save_png_svg(fig, out / "rate_capability")
+    return _save_png_svg(fig, out / "rate_capability", pd.DataFrame(rows))
 
 
 def plot_window(blocks, masses, sample_id, out: Path) -> list[Path]:
@@ -304,7 +386,14 @@ def plot_window(blocks, masses, sample_id, out: Path) -> list[Path]:
     h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, frameon=False, loc="lower left", fontsize=7)
     _subtitle(fig, sample_id, masses)
-    return _save_png_svg(fig, out / "window_plot")
+    data = pd.DataFrame([dict(
+        window=window_label(window_key(b)), window_type=b["window_type"], U_max_V=b["U_max"],
+        nu_nom_mVs=b["nu_nom_mVs"], block=b["block"], occurrence=b["occurrence"],
+        C_F=b["C"], C_el_Fg=b["C_el"],
+        eta_plus=b["pol"]["+"]["eta"],
+        eta_minus=b["pol"]["-"]["eta"] if "-" in b["pol"] else np.nan,
+        eta_min=cfg.EFFICIENCY_MIN) for b in rep])
+    return _save_png_svg(fig, out / "window_plot", data)
 
 
 def plot_normalised(df, blocks, masses, sample_id, out: Path) -> list[Path]:
@@ -316,20 +405,25 @@ def plot_normalised(df, blocks, masses, sample_id, out: Path) -> list[Path]:
     last = _last_occurrence(blocks)
     paths = []
     for key in window_styles(blocks):
-        sel = sorted((nu, b) for (k, nu), b in last.items() if k == key)
+        sel = sorted(((nu, b) for (k, nu), b in last.items() if k == key), key=lambda t: t[0])
         colors = rate_colors([nu for nu, _ in sel])
         fig, ax = plt.subplots(figsize=(6.4, 4.6))
+        data = []
         for nu, b in sel:
-            cyc = _cycle_frame(df, b)
-            y = 2.0 * cyc["I12"] / 1000.0 / (b["nu_meas_Vs"] * masses["m_mean_g"])
-            ax.plot(cyc["V12"], y, color=colors[nu], linewidth=1.4, label=f"{nu:g} mV s⁻¹")
+            d = _curve_data(df, b)
+            d["nu_meas_mVs"] = b["nu_meas_Vs"] * 1000.0
+            d["C_diff_el_Fg"] = 2.0 * d["I12_mA"] / 1000.0 / (b["nu_meas_Vs"] * masses["m_mean_g"])
+            data.append(d)
+            ax.plot(d["V12_V"], d["C_diff_el_Fg"], color=colors[nu], linewidth=1.4,
+                    label=f"{nu:g} mV s⁻¹")
         _style_axes(ax)
         ax.set_xlabel("Cell voltage V12 (V)")
         ax.set_ylabel("Differential electrode capacitance (F g⁻¹)")
         ax.set_title(f"Normalised CV, window {window_label(key)}", loc="left")
         ax.legend(title="Scan rate", frameon=False)
         _subtitle(fig, sample_id, masses)
-        paths += _save_png_svg(fig, out / f"normalised_{window_slug(key)}")
+        paths += _save_png_svg(fig, out / f"normalised_{window_slug(key)}",
+                               pd.concat(data, ignore_index=True))
     return paths
 
 

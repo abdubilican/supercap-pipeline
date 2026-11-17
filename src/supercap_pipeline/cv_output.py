@@ -30,6 +30,21 @@ SEGMENTS = {  # (discharge, charge) segment names per polarity
 }
 
 
+def _plain_number(x: float) -> str:
+    """Positional notation (never 1e-05) with a decimal point, e.g. -0.00001."""
+    return np.format_float_positional(x, precision=10, unique=True, trim="-")
+
+
+def write_csv(df: pd.DataFrame, path: Path) -> Path:
+    """
+    CSV with ';' as separator, decimal point, no exponent notation, UTF-8
+    with BOM (so '±' is shown correctly in Excel). Read back with
+    pd.read_csv(sep=';').
+    """
+    df.to_csv(path, sep=";", index=False, encoding="utf-8-sig", float_format=_plain_number)
+    return path
+
+
 def _block_cols(b: dict, sample_id: str, source: str) -> dict:
     return {
         "sample_id": sample_id,
@@ -162,5 +177,5 @@ def write_results(out_dir: Path, results: pd.DataFrame, summary: pd.DataFrame,
         meta.to_excel(xw, sheet_name="Meta", index=False)
         pd.DataFrame({"warning": warnings or ["(none)"]}).to_excel(
             xw, sheet_name="Warnings", index=False)
-    results.to_csv(csv, index=False)
+    write_csv(results, csv)
     return [xlsx, csv]
