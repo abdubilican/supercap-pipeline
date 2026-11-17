@@ -101,6 +101,36 @@ def test_gcd_floating_plot_workbooks(tmp_path):
     assert metas["gcd_floating_efficiency"]["curves"] == 2
 
 
+def test_peis_plot_workbooks(tmp_path):
+    from peis_synth import ImpedanceFile
+    from supercap_pipeline.pipeline import run_peis_export
+
+    imp = ImpedanceFile()
+    for v in (0, 2.5, 0):
+        imp.spectrum(v)                      # each spectrum has 1 excluded point
+    imp.write(tmp_path / "03_PEIS")
+    r = run_peis_export(tmp_path / "03_PEIS" / "Output-Impedance.txt", output_dir=tmp_path / "out")
+    metas = _all_plot_workbooks(r["out"] / "plots")
+    n = 3
+    # overlay: one curve per spectrum + one "excluded" curve per spectrum (+ frequency marks)
+    assert metas["peis_nyquist"]["curves"] == 2 * n + 1
+    assert metas["peis_nyquist_area"]["curves"] == 2 * n + 1
+    assert metas["peis_bode"]["curves"] == 2 * n
+    assert metas["peis_cs_vs_f"]["curves"] == 2 * n
+    assert metas["peis_complex_capacitance"]["curves"] == 2 * n + 1          # + f0 points
+    assert metas["peis_complex_capacitance_specific"]["curves"] == 2 * n + 1
+    assert metas["peis_kk_residuals"]["curves"] == n
+    assert metas["peis_parameters_vs_voltage"]["curves"] == 9
+    for slug in ("0V_1", "2p5V", "0V_2"):
+        # measured, excluded, fit, residuals, frequency marks
+        assert metas[f"peis_fit_nyquist_{slug}"]["curves"] == 5
+        assert metas[f"peis_fit_bode_{slug}"]["curves"] == 3
+        assert metas[f"peis_kk_{slug}"]["curves"] == 1
+    assert "area_cm2" in metas["peis_nyquist"] and "excluded_point_rules" in metas["peis_nyquist"]
+    labels = metas["peis_nyquist"]["curve_labels"]
+    assert "0 V (1) excluded" in labels and "2.5 V" in labels
+
+
 def test_cv_plot_workbooks(tmp_path):
     cell = cv_synth.symmetric_program([(1.0, 0.001), (1.0, 0.010), (2.0, 0.001)], n_cycles=2)
     folder = tmp_path / "01_CV"

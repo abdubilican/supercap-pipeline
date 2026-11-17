@@ -91,7 +91,7 @@ class GcdCell:
         I = (U - vc) / self.R                                               # A
         Q = ((U - vinf) * ts - (self.Vc - vinf) * tau * (1 - e)) / self.R   # C
         self._emit(ts, np.full_like(ts, U), I * 1000.0, Q / 3.6, self.W + U * Q / 3.6,
-                   "CV", "c", "v12")
+                   "CV", "c", "i12_V12")
         self.W += U * Q[-1] / 3.6
         self.Vc = float(vc[-1])
 

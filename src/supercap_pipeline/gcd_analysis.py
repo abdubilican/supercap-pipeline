@@ -27,7 +27,7 @@ from .gcd_segmentation import CYCLING, FLOATING, HOLD, RATE, cluster_values
 
 log = logging.getLogger("supercap_pipeline.gcd").getChild("analysis")
 
-FLAG, WARNING, INFO = "flag", "warning", "info"
+from .flags import FLAG, INFO, WARNING  # noqa: E402  (shared severities)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

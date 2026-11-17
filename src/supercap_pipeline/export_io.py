@@ -38,10 +38,14 @@ MASS_MAX_G = 1.0                   # outside it the unit is probably not g -> er
 
 @dataclass(frozen=True)
 class ColumnSet:
-    """Columns to read: numeric, string, and the subset that may be absent."""
+    """
+    Columns to read: numeric, string, the subset that may be absent, and the
+    columns whose missing values drop a row (default t and V12).
+    """
     numeric: tuple[str, ...]
     strings: tuple[str, ...]
     optional: tuple[str, ...] = ()
+    dropna_on: tuple[str, ...] = ("t", "V12")
 
     @property
     def all(self) -> tuple[str, ...]:
@@ -57,6 +61,16 @@ GCD_COLUMNS = ColumnSet(("t", "t_step", "cycle", "step", "V12", "I12", "Qcd", "W
                         ("type", "c/d", "con"), optional=("con",))
 # Only the step type: used to decide CV vs GCD per file.
 TYPE_COLUMNS = ColumnSet((), ("type",))
+# PEIS (lab guide PEIS 1.1): Output-Impedance.txt. The half-cell impedance
+# columns are optional (NaN in two-electrode cells); no row is dropped here --
+# the PEIS module drops the NaN end row of every spectrum itself and logs it.
+IMPEDANCE_FILE = "Output-Impedance.txt"
+HALF_CELL_COLUMNS = ("Re(Z1)", "Im(Z1)", "Re(Z2)", "Im(Z2)", "Re(ZR)", "Im(ZR)",
+                     "Re(Z1R)", "Im(Z1R)", "Re(Z2R)", "Im(Z2R)")
+PEIS_COLUMNS = ColumnSet(
+    ("freq", "t", "step", "V12", "dV12", "I12", "dI12", "Re(Z12)", "Im(Z12)", "|Z12|",
+     "phi(Z12)", "SFDR(Z12)", "Cs", "dt") + HALF_CELL_COLUMNS,
+    ("type",), optional=("dI12", "dt") + HALF_CELL_COLUMNS, dropna_on=())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,14 +118,14 @@ def read_export(path: str | Path, columns: ColumnSet = CV_COLUMNS) -> pd.DataFra
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     n_raw = len(df)
-    key = [c for c in ("t", "V12") if c in df.columns]
+    key = [c for c in columns.dropna_on if c in df.columns]
     if key:
         df = df.dropna(subset=key).reset_index(drop=True)
     for c in ("cycle", "step"):
         if c in df.columns:
             df[c] = df[c].fillna(-1).astype(int)
-    log.info("Read %s: %d data rows (%d without t/V12 ignored)",
-             path.name, len(df), n_raw - len(df))
+    log.info("Read %s: %d data rows (%d without %s ignored)",
+             path.name, len(df), n_raw - len(df), "/".join(key) or "-")
     return df
 
 
@@ -294,6 +308,48 @@ def read_masses(path: str | Path) -> dict:
     log.info("Masses from %s: m1 = %.6g g, m2 = %.6g g, m_mean = %.6g g",
              path.name, result["m1_g"], result["m2_g"], result["m_mean_g"])
     return result
+
+
+_DIAMETER_KEYS = ("d", "diameter", "electrode diameter", "d_el", "del", "electrode_diameter")
+_AREA_KEYS = ("a", "area", "electrode area", "a_el", "ael", "electrode_area")
+_LEN_UNIT_RE = re.compile(r"^\s*(.*?)\s*[\[(]?\s*(mm2|mm²|mm\^2|cm2|cm²|cm\^2|mm|cm)\s*[\])]?\s*$",
+                          re.IGNORECASE)
+
+
+def read_electrode_area(path: str | Path) -> dict | None:
+    """
+    Electrode area from Input-Variables.txt (lab guide PEIS 1.2), if the file
+    holds an electrode diameter or area. Keys: d / diameter (unit mm or cm,
+    default mm), A / area (unit cm2 or mm2, default cm2); the unit may be in
+    the key ("d [mm]") or the value ("18 mm"). A = pi (d/2)^2.
+    Returns {"area_cm2", "diameter_mm", "source"} or None if neither is given.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    for e in reversed(_parse_key_values(path)):
+        km = _LEN_UNIT_RE.match(e["key"])
+        key, kunit = (km.group(1), km.group(2)) if km else (e["key"], None)
+        vm = _LEN_UNIT_RE.match(e["raw"])
+        raw, vunit = (vm.group(1), vm.group(2)) if vm else (e["raw"], None)
+        unit = (vunit or kunit or "").lower().replace("²", "2").replace("^2", "2")
+        value = _to_float(raw)
+        if value is None or value <= 0:
+            continue
+        k = key.strip().lower()
+        if k in _DIAMETER_KEYS and unit in ("", "mm", "cm"):
+            d_mm = value * 10.0 if unit == "cm" else value
+            area = np.pi * (d_mm / 20.0) ** 2
+            src = f"{path.name}: {e['key']} = {e['raw']} (diameter {d_mm:g} mm)"
+            log.info("Electrode area from %s -> %.4g cm2", src, area)
+            return {"area_cm2": area, "diameter_mm": d_mm, "source": src}
+        if k in _AREA_KEYS and unit in ("", "cm2", "mm2"):
+            area = value / 100.0 if unit == "mm2" else value
+            src = f"{path.name}: {e['key']} = {e['raw']}"
+            log.info("Electrode area from %s -> %.4g cm2", src, area)
+            return {"area_cm2": area, "diameter_mm": float(np.sqrt(area / np.pi) * 20.0),
+                    "source": src}
+    return None
 
 
 def _to_float(s: str) -> float | None:

@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from . import gcd_config as cfg
-from .gcd_analysis import FLAG, INFO, WARNING
+from .flags import FLAG, INFO, WARNING, sort_flags
 from .gcd_segmentation import CYCLING, FLOATING, RATE
 from .results_io import pipeline_version, write_csv, write_workbook
 
@@ -182,10 +182,8 @@ def flags_table(ev: pd.DataFrame, rate: pd.DataFrame, series_flags: list,
         if f["eol_criterion"] != "not reached":
             add(INFO, "series", f"end of life at {f['eol_eol_x']:.1f} h hold time "
                                f"({f['eol_criterion']})", test=FLOATING, j=f["j"])
-    out = pd.DataFrame(rows, columns=["severity", "scope", "block", "cycle", "test_type",
-                                      "j_Ag", "flag", "explanation"])
-    out["_order"] = out["severity"].map({FLAG: 0, WARNING: 1, INFO: 2})
-    return out.sort_values("_order", kind="stable").drop(columns="_order").reset_index(drop=True)
+    return sort_flags(pd.DataFrame(rows, columns=["severity", "scope", "block", "cycle",
+                                                  "test_type", "j_Ag", "flag", "explanation"]))
 
 
 def meta_table(masses: dict, sample_id: str, source: str, ev: pd.DataFrame,

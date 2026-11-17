@@ -101,6 +101,21 @@ def test_detect_technique_eis_by_step_type(tmp_path):
     assert detect_technique(folder) == "eis"
 
 
+def test_impedance_export_routes_to_peis(tmp_path, monkeypatch):
+    # PEIS program folder: Output.txt with CC/CV/PEIS steps + Output-Impedance.txt
+    folder = tmp_path / "A0001" / "03_PEIS - Supercapacitor"
+    _write_output_txt(folder, ["0.0\t1\t20\tCC\tc\t0.0\t1.0", "1.0\t1\t50\tPEIS\t-\t0.0\t0.0"])
+    (folder / "Output-Impedance.txt").write_text(
+        "freq\tt\tstep\ttype\r\nHz\ts\t\t\r\n1000\t1.0\t50\tPEIS \r\n", encoding="ascii")
+    assert detect_technique(folder) == "peis"
+    assert detect_technique(folder / "Output-Impedance.txt") == "peis"
+    calls = []
+    monkeypatch.setattr("supercap_pipeline.pipeline.run_peis",
+                        lambda folder, output_dir=None, **kw: calls.append(Path(folder).name))
+    run_experiment(tmp_path)
+    assert calls == ["03_PEIS - Supercapacitor"]
+
+
 def test_detect_technique_any_cc_step_is_gcd(tmp_path):
     # lab guide GCD: decided per file from the step types (CC -> GCD); a
     # charge-only file goes to the GCD module, which reports that it has no cycles

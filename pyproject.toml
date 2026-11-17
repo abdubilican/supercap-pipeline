@@ -8,6 +8,8 @@ dependencies = [
     "numpy>=1.26",
     "matplotlib>=3.9",
     "openpyxl>=3.1",
+    "impedance==1.7.1",
+    "scipy>=1.10",
     "python-calamine>=0.2",
 ]
 
